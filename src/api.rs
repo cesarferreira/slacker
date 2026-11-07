@@ -17,6 +17,8 @@ pub struct Conversation {
     #[serde(default)]
     pub is_private: bool,
     #[serde(default)]
+    pub is_shared: bool,
+    #[serde(default)]
     pub is_member: bool,
 }
 
@@ -89,11 +91,29 @@ pub struct Message {
     pub reactions: Vec<Reaction>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Presence {
+    Active,
+    Away,
+    DoNotDisturb,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Person {
+    pub display_name: String,
+    pub status_emoji: String,
+    pub status_text: String,
+    pub is_bot: bool,
+}
+
 pub struct Snapshot {
     pub workspace: String,
     pub me: String,
     pub conversations: Vec<Conversation>,
     pub users: HashMap<String, String>,
+    pub people: HashMap<String, Person>,
 }
 
 pub struct History {
@@ -284,6 +304,7 @@ impl Slack {
     pub fn bootstrap(&self) -> Result<Snapshot> {
         let auth = self.request("auth.test", &[])?;
         let mut users = HashMap::new();
+        let mut people = HashMap::new();
         for user in self.pages("users.list", "members", &[("limit", "200")])? {
             let id = user["id"].as_str().unwrap_or("");
             let name = [
@@ -296,6 +317,21 @@ impl Slack {
             .find(|s| !s.is_empty())
             .unwrap_or(id);
             users.insert(id.to_owned(), name.to_owned());
+            people.insert(
+                id.to_owned(),
+                Person {
+                    display_name: name.to_owned(),
+                    status_emoji: user["profile"]["status_emoji"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned(),
+                    status_text: user["profile"]["status_text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned(),
+                    is_bot: user["is_bot"].as_bool().unwrap_or(false),
+                },
+            );
         }
         let mut conversations = Vec::new();
         let entries = if self.session {
@@ -354,7 +390,96 @@ impl Slack {
             me: auth["user_id"].as_str().unwrap_or("").to_owned(),
             conversations,
             users,
+            people,
         })
+    }
+
+    /// Poll up to ten distinct visible people; callers should poll no more than once a minute.
+    /// Empty IDs are ignored. Missing or unrecognized states remain unknown; any request
+    /// error fetching base presence stops the batch, and callers should invalidate its
+    /// cached values. One best-effort DND batch overrides only current suppression.
+    pub fn presences(&self, user_ids: &[String]) -> Result<HashMap<String, Presence>> {
+        let mut ids = Vec::new();
+        for id in user_ids {
+            if !id.is_empty() && !ids.contains(&id.as_str()) {
+                ids.push(id.as_str());
+            }
+            if ids.len() > 10 {
+                bail!("Presence lookup supports at most 10 distinct people");
+            }
+        }
+        let mut presences = HashMap::new();
+        for &id in &ids {
+            let value = self.request("users.getPresence", &[("user", id)])?;
+            let presence = match value["presence"].as_str() {
+                Some("active") => Presence::Active,
+                Some("away") => Presence::Away,
+                _ => Presence::Unknown,
+            };
+            presences.insert(id.to_owned(), presence);
+        }
+        if !ids.is_empty()
+            && let Ok(dnd) = self.request("dnd.teamInfo", &[("users", &ids.join(","))])
+            && let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        {
+            let now = now.as_secs();
+            for id in ids {
+                let state = &dnd["users"][id];
+                let snoozing = (state["snooze_enabled"].as_bool() == Some(true)
+                    || state["snooze_active"].as_bool() == Some(true))
+                    && state["snooze_endtime"]
+                        .as_u64()
+                        .is_some_and(|end| now < end);
+                let scheduled = state["dnd_enabled"].as_bool() == Some(true)
+                    && state["next_dnd_start_ts"]
+                        .as_u64()
+                        .is_some_and(|start| start <= now)
+                    && state["next_dnd_end_ts"]
+                        .as_u64()
+                        .is_some_and(|end| now < end);
+                if snoozing || scheduled {
+                    presences.insert(id.to_owned(), Presence::DoNotDisturb);
+                }
+            }
+        }
+        Ok(presences)
+    }
+
+    /// Fetch desktop-session unread badges in one request. Values fall back to
+    /// one/zero when Slack supplies only `has_unreads`, so they are not exact counts.
+    /// Missing conversation entries or unread fields remain absent (unknown).
+    pub fn unread_counts(&self) -> Result<HashMap<String, usize>> {
+        if !self.session {
+            bail!("Workspace unread badges require Slack desktop sign-in");
+        }
+        let value = self.request("client.counts", &[])?;
+        let mut counts = HashMap::new();
+        let mut found_collection = false;
+        for key in ["channels", "ims", "mpims"] {
+            let Some(entries) = value.get(key) else {
+                continue;
+            };
+            let entries = entries
+                .as_array()
+                .context("Slack unread response has an invalid conversation collection")?;
+            found_collection = true;
+            for entry in entries {
+                let Some(id) = entry["id"].as_str().filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                let count = ["unread_count_display", "unread_count"]
+                    .into_iter()
+                    .find_map(|key| entry[key].as_u64().and_then(|n| usize::try_from(n).ok()))
+                    .or_else(|| entry["has_unreads"].as_bool().map(usize::from));
+                if let Some(count) = count {
+                    counts.insert(id.to_owned(), count);
+                }
+            }
+        }
+        if !found_collection {
+            bail!("Slack unread response is missing conversation collections");
+        }
+        Ok(counts)
     }
 
     pub fn history(
