@@ -5,7 +5,10 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -87,6 +90,25 @@ fn toolbar(frame: &mut Frame, ui: &mut UiState, area: Rect, buttons: &[(&str, Ac
         );
         x = x.saturating_add(width + 1);
     }
+}
+
+fn scrollbar(frame: &mut Frame, area: Rect, length: usize, position: usize, viewport: usize) {
+    if length <= viewport || area.is_empty() {
+        return;
+    }
+    let mut state = ScrollbarState::new(length)
+        .position(position)
+        .viewport_content_length(viewport);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("┃")
+            .thumb_style(Style::default().fg(Color::Rgb(103, 72, 117))),
+        area,
+        &mut state,
+    );
 }
 
 fn ellipsize(text: &str, width: usize) -> String {
@@ -241,6 +263,13 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
                 ("v Media", Action::Media),
             ],
         );
+        scrollbar(
+            frame,
+            chunks[0],
+            ui.read_scroll_max + chunks[0].height as usize,
+            scroll,
+            chunks[0].height as usize,
+        );
         for (index, row) in attachment_lines {
             if row >= scroll && row < scroll + chunks[0].height as usize {
                 ui.hits.push(Hit {
@@ -363,6 +392,13 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
             });
         }
     }
+    scrollbar(
+        frame,
+        cols[0],
+        channel_rows.len(),
+        ui.channels.offset(),
+        inner.height as usize,
+    );
     let main = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
@@ -501,6 +537,19 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
             .style(Style::default().fg(FG)),
         main[1],
         &mut ui.messages,
+    );
+    let content_lines: usize = heights.iter().map(|h| *h as usize).sum();
+    let scrolled_lines: usize = heights
+        .iter()
+        .take(ui.messages.offset())
+        .map(|h| *h as usize)
+        .sum();
+    scrollbar(
+        frame,
+        main[1],
+        content_lines,
+        scrolled_lines,
+        main[1].height as usize,
     );
     let mut y = main[1].y;
     for (index, height) in heights.iter().enumerate().skip(ui.messages.offset()) {
