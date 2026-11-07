@@ -55,6 +55,8 @@ fn accepted_channel_refresh_drives_unread_title_but_thread_pages_do_not() {
     app.demo = false;
     app.receive(Reply::History {
         id: app.generation,
+        channel: app.current_id().unwrap().into(),
+        thread: None,
         append: false,
         result: Ok(History {
             messages: vec![message("100.000001", "other")],
@@ -64,6 +66,8 @@ fn accepted_channel_refresh_drives_unread_title_but_thread_pages_do_not() {
     app.notifications.focus(false);
     app.receive(Reply::History {
         id: app.generation,
+        channel: app.current_id().unwrap().into(),
+        thread: None,
         append: false,
         result: Ok(History {
             messages: vec![message("101.000001", "other")],
@@ -78,7 +82,9 @@ fn accepted_channel_refresh_drives_unread_title_but_thread_pages_do_not() {
     );
     app.open_thread();
     app.receive(Reply::History {
-        id: app.generation,
+        id: app.thread_view.as_ref().unwrap().generation,
+        channel: app.current_id().unwrap().into(),
+        thread: app.thread.clone(),
         append: true,
         result: Ok(History {
             messages: vec![message("200.000001", "other")],

@@ -80,8 +80,9 @@ in a full-screen terminal viewer. `Space` pauses video; `Esc` closes it.
 `--graphics off` keeps chat usable in other terminals. Automatic
 graphics detection is disabled inside tmux; passthrough is not implemented.
 
-The offline demo includes two photo posts, a four-second video with a poster,
-emoji reactions, and threads with replies. Images appear directly in the chat.
+The offline demo has distinct conversations in general, engineering, design,
+random, and direct messages, with photos, a four-second video, emoji reactions,
+and contextual thread replies. Images appear directly in the chat.
 Click an image or video to open it, a reaction to toggle it locally, or a replies
 link to read and reply in the thread. Demo messages and replies stay available
 while switching conversations during the session. No Slack token or network is
@@ -155,18 +156,31 @@ They are not Slack's workspace-wide unread totals. Automatic refresh must be
 enabled for background alerts; terminals without focus reporting can still
 clear the count when you press a key or click.
 
+### Panes and people
+
+Drag the divider beside the sidebar to resize it. Clicking a replies link opens
+an independent thread panel on the right; drag its divider to adjust its width.
+Channel and thread drafts stay separate, and sending keeps the composer focused.
+Scrolling another pane preserves your typing destination.
+
+The pinned People section shows existing direct messages by colleague name, with
+online (●), away (○), do not disturb (⊘), or unknown (·) presence and status emoji.
+Presence refreshes for visible people at most once per minute. Blue sidebar dots
+show Slack unread state when desktop-session unread counts are available.
+
 ### Keyboard and mouse
 
 | Action | Shortcut / mouse |
 | --- | --- |
 | Select conversation or message | `j` / `k`, arrows, click; wheel moves through the list under the pointer |
-| Focus conversations / messages | `h` / `l`, `Tab` |
+| Cycle sidebar / channel / thread panes | `h` / `l`, `Tab` |
 | Open conversation | `Enter` in the sidebar, or click its name |
 | Find a conversation | `Ctrl+K`, type a fuzzy query, `Enter`; click a result |
 | Compose | Click the message field, or press `i` |
 | Send | `Enter` while typing, or click Send (shown for a nonempty draft) |
 | Newline | `Alt+Enter`; bracketed paste preserves newlines |
-| Open thread | `t`, `Enter` on a message, or click Thread |
+| Open right thread panel | `t`, `Enter` on a message, or click its replies link |
+| Resize panes | Drag the sidebar or thread divider |
 | Read a long message | `o` or click Read; `j` / `k`, page keys, or wheel scroll |
 | View media | `v` for the first image/video, or click an attachment |
 | Pause / resume video | `Space`, or click Pause / play |

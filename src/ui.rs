@@ -39,6 +39,15 @@ pub enum Action {
     Back,
     Close,
     Pause,
+    ThreadMessage(usize),
+    ThreadAttachment(usize, usize),
+    ThreadReaction(usize, usize),
+    ThreadCompose,
+    ThreadSend,
+    ThreadRead,
+    ThreadRefresh,
+    ThreadMedia,
+    CloseThread,
 }
 pub struct Hit {
     pub action: Action,
@@ -50,16 +59,32 @@ pub struct InlineImage {
     pub rect: Rect,
     pub id: u32,
 }
+#[derive(Clone, Copy)]
+enum Divider {
+    Sidebar,
+    Thread,
+}
 #[derive(Default)]
 pub struct UiState {
     pub hits: Vec<Hit>,
     pub inline_images: Vec<InlineImage>,
     pub message_area: Rect,
+    pub thread_area: Rect,
+    pub people_area: Rect,
+    pub sidebar_divider: Rect,
+    pub thread_divider: Rect,
+    pub visible_people: Vec<String>,
+    bounds: Rect,
+    dragging: Option<Divider>,
+    manual_sidebar_scroll: bool,
+    manual_people_scroll: bool,
     pub sidebar_area: Rect,
     pub media_area: Rect,
     pub read_scroll_max: usize,
     channels: ListState,
     messages: ListState,
+    thread_messages: ListState,
+    people: ListState,
     switcher: ListState,
 }
 
@@ -165,264 +190,332 @@ pub fn display_text(app: &App, text: &str) -> String {
     )
 }
 
-pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
-    let area = frame.area();
-    ui.hits.clear();
-    ui.inline_images.clear();
-    ui.media_area = Rect::default();
-    frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
-    if area.width < 38 || area.height < 12 {
-        frame.render_widget(
-            Paragraph::new("Make the terminal at least 38 × 12.\nCtrl+C quits.")
-                .style(Style::default().fg(ACCENT)),
-            area,
-        );
-        return;
-    }
-    if let Some(viewer) = &app.viewer {
-        let chunks = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(2),
-        ])
-        .split(area);
-        let name = &viewer.prepared.title;
-        frame.render_widget(
-            Paragraph::new(format!("  MEDIA / {}", safe_text(name)))
-                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            chunks[0],
-        );
-        ui.media_area = chunks[1].inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 0,
-        });
-        if viewer.last.is_none() {
-            frame.render_widget(
-                Paragraph::new(viewer.note.as_str())
-                    .centered()
-                    .style(Style::default().fg(MUTED)),
-                ui.media_area,
-            );
-        }
-        toolbar(
-            frame,
-            ui,
-            chunks[2],
-            &[
-                ("Esc Close", Action::Close),
-                (
-                    if viewer
-                        .video
-                        .as_ref()
-                        .is_some_and(|v| v.paused.load(std::sync::atomic::Ordering::Relaxed))
-                    {
-                        "Space Resume"
-                    } else {
-                        "Space Pause"
-                    },
-                    Action::Pause,
-                ),
-            ],
-        );
-        return;
-    }
-    if app.mode == Mode::Read {
-        let popup = area.inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
-        let block = border(" Message · j/k or wheel scroll · Esc closes ", true);
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-        let mut lines = Vec::new();
-        let mut attachment_lines = Vec::new();
-        if let Some(message) = app.messages.get(app.selected) {
-            for line in display_text(app, &message.text).split('\n') {
-                lines.extend(
-                    textwrap::wrap(line, chunks[0].width.max(1) as usize)
-                        .into_iter()
-                        .map(|s| Line::from(s.into_owned())),
-                );
-            }
-            for (index, file) in message.files.iter().enumerate() {
-                if file.is_media() {
-                    attachment_lines.push((index, lines.len()));
-                }
-                lines.push(Line::from(Span::styled(
-                    format!(" ▧ {}", safe_text(&file.name)),
-                    Style::default().fg(GREEN),
-                )));
-            }
-        }
-        ui.read_scroll_max = lines.len().saturating_sub(chunks[0].height as usize);
-        let scroll = app.read_scroll.min(ui.read_scroll_max);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .scroll((scroll.min(u16::MAX as usize) as u16, 0))
-                .style(Style::default().fg(FG)),
-            chunks[0],
-        );
-        toolbar(
-            frame,
-            ui,
-            chunks[1],
-            &[
-                ("Esc Close", Action::Close),
-                ("Thread", Action::Thread),
-                ("Media", Action::Media),
-            ],
-        );
-        scrollbar(
-            frame,
-            chunks[0],
-            ui.read_scroll_max + chunks[0].height as usize,
-            scroll,
-            chunks[0].height as usize,
-        );
-        for (index, row) in attachment_lines {
-            if row >= scroll && row < scroll + chunks[0].height as usize {
-                ui.hits.push(Hit {
-                    rect: Rect::new(
-                        chunks[0].x,
-                        chunks[0].y + (row - scroll) as u16,
-                        chunks[0].width,
-                        1,
-                    ),
-                    action: Action::Attachment(app.selected, index),
-                });
-            }
-        }
-        ui.message_area = chunks[0];
-        return;
-    }
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(4),
-        Constraint::Length(1),
-    ])
-    .split(area);
-    let header = Layout::horizontal([Constraint::Min(10), Constraint::Length(28)]).split(rows[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "  slacker  ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(safe_text(&app.workspace), Style::default().fg(MUTED)),
-        ])),
-        header[0],
-    );
-    toolbar(
-        frame,
-        ui,
-        header[1],
-        &[("Ctrl+K Jump", Action::Switch), ("? Help", Action::Help)],
-    );
-    let sidebar_width = if area.width >= 85 {
-        (area.width / 3).clamp(28, 42)
-    } else if area.width >= 60 {
-        23
-    } else {
-        17
-    };
-    let cols =
-        Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(15)]).split(rows[1]);
-    ui.sidebar_area = cols[0];
-    let sidebar = Block::default()
+fn draw_sidebar(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
+    use crate::api::Presence;
+    ui.sidebar_area = area;
+    ui.sidebar_divider = Rect::new(area.right().saturating_sub(1), area.y, 1, area.height);
+    let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(if app.focus == Focus::Channels {
-            Color::Rgb(103, 72, 117)
-        } else {
-            Color::Rgb(57, 35, 65)
-        }))
+        .border_style(Style::default().fg(Color::Rgb(79, 53, 90)))
         .style(Style::default().bg(PANEL));
-    let inner = sidebar.inner(cols[0]);
-    frame.render_widget(sidebar, cols[0]);
-    let mut items = Vec::new();
-    let mut channel_rows = Vec::new();
-    items.push(ListItem::new(""));
-    channel_rows.push(None);
-    for (is_dm, heading) in [(false, "#  Channels"), (true, "◉  Direct messages")] {
-        if !app.conversations.iter().any(|c| c.is_im == is_dm) {
-            continue;
-        }
-        if is_dm {
-            items.push(ListItem::new(""));
-            channel_rows.push(None);
-        }
-        items.push(ListItem::new(format!("  {heading}")).style(Style::default().fg(MUTED)));
-        channel_rows.push(None);
-        for (index, conversation) in app
-            .conversations
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.is_im == is_dm)
-        {
-            let icon = if conversation.is_im {
-                "•"
-            } else if conversation.is_private {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let channel_ids: Vec<_> = app
+        .conversations
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_im)
+        .map(|(i, _)| i)
+        .collect();
+    let people_ids: Vec<_> = app
+        .conversations
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_im)
+        .map(|(i, _)| i)
+        .collect();
+    let people_height = if people_ids.is_empty() {
+        0
+    } else {
+        (inner.height / 3)
+            .clamp(5, 12)
+            .min(inner.height.saturating_sub(3))
+    };
+    let channels = Rect::new(inner.x, inner.y, inner.width, inner.height - people_height);
+    let people = Rect::new(inner.x, channels.bottom(), inner.width, people_height);
+    frame.render_widget(
+        Paragraph::new(" #  Channels").style(Style::default().fg(ACCENT)),
+        Rect::new(
+            channels.x,
+            channels.y + u16::from(channels.height > 1),
+            channels.width,
+            1.min(channels.height),
+        ),
+    );
+    let body = Rect::new(
+        channels.x,
+        channels.y + 2.min(channels.height),
+        channels.width,
+        channels.height.saturating_sub(2),
+    );
+    let items: Vec<_> = channel_ids
+        .iter()
+        .map(|index| {
+            let c = &app.conversations[*index];
+            let unread = app.unread_counts.get(&c.id).copied().unwrap_or(0) > 0;
+            let active = *index == app.channel;
+            let icon = if c.is_private {
                 "🔒"
+            } else if c.is_shared {
+                "◆"
             } else {
                 "#"
             };
-            let label = format!("    {icon}  {}", safe_text(&conversation.name));
-            let active = index == app.channel;
-            items.push(
-                ListItem::new(ellipsize(&label, inner.width as usize)).style(
+            let prefix = format!("  {icon} ");
+            let width = body
+                .width
+                .saturating_sub(prefix.width() as u16 + if unread { 3 } else { 1 });
+            let name = ellipsize(&safe_text(&c.name), width as usize);
+            let mut spans = vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if c.is_shared {
+                        Color::Rgb(235, 192, 119)
+                    } else {
+                        MUTED
+                    }),
+                ),
+                Span::styled(
+                    name,
                     Style::default()
-                        .fg(if active { FG } else { MUTED })
-                        .add_modifier(if active {
+                        .fg(if unread || active { FG } else { MUTED })
+                        .add_modifier(if unread || active {
                             Modifier::BOLD
                         } else {
                             Modifier::empty()
                         }),
                 ),
-            );
-            channel_rows.push(Some(index));
-        }
+            ];
+            if unread {
+                spans.push(Span::styled(
+                    " ●",
+                    Style::default().fg(Color::Rgb(112, 195, 211)),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let selected = if app.focus == Focus::Channels {
+        Some(app.sidebar)
+    } else if app.conversations.get(app.channel).is_some_and(|c| !c.is_im) {
+        Some(app.channel)
+    } else {
+        None
+    };
+    let manual_offset = ui.channels.offset();
+    ui.channels.select(if ui.manual_sidebar_scroll {
+        None
+    } else {
+        selected.and_then(|i| channel_ids.iter().position(|index| *index == i))
+    });
+    if ui.manual_sidebar_scroll {
+        *ui.channels.offset_mut() = manual_offset;
     }
-    ui.channels
-        .select(channel_rows.iter().position(|i| *i == Some(app.sidebar)));
     frame.render_stateful_widget(
-        List::new(items).highlight_style(Style::default().bg(SELECTED).fg(FG)),
-        inner,
+        List::new(items).highlight_style(Style::default().bg(SELECTED)),
+        body,
         &mut ui.channels,
     );
-    for (row, index) in channel_rows
+    for (row, index) in channel_ids
         .iter()
         .skip(ui.channels.offset())
-        .take(inner.height as usize)
+        .take(body.height as usize)
         .enumerate()
     {
-        if let Some(index) = index {
-            ui.hits.push(Hit {
-                rect: Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
-                action: Action::Channel(*index),
-            });
+        ui.hits.push(Hit {
+            rect: Rect::new(body.x, body.y + row as u16, body.width, 1),
+            action: Action::Channel(*index),
+        });
+    }
+    scrollbar(
+        frame,
+        channels,
+        channel_ids.len(),
+        ui.channels.offset(),
+        body.height as usize,
+    );
+    ui.people_area = people;
+    if people_height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Rgb(66, 45, 74))),
+        people,
+    );
+    frame.render_widget(
+        Paragraph::new(" ◉  People").style(Style::default().fg(ACCENT)),
+        Rect::new(
+            people.x,
+            people.y + 1.min(people.height),
+            people.width,
+            1.min(people.height),
+        ),
+    );
+    let body = Rect::new(
+        people.x,
+        people.y + 2.min(people.height),
+        people.width,
+        people.height.saturating_sub(2),
+    );
+    let items: Vec<_> = people_ids
+        .iter()
+        .map(|index| {
+            let c = &app.conversations[*index];
+            let (symbol, color) = match app.presences.get(&c.user).copied().unwrap_or_default() {
+                Presence::Active => ("●", GREEN),
+                Presence::Away => ("○", MUTED),
+                Presence::Unknown => ("·", Color::Rgb(112, 94, 122)),
+                Presence::DoNotDisturb => ("⊘", Color::Rgb(235, 192, 119)),
+            };
+            let person = app.people.get(&c.user);
+            let name = person
+                .filter(|p| !p.display_name.is_empty())
+                .map_or(c.name.as_str(), |p| p.display_name.as_str());
+            let status = person
+                .filter(|p| !p.status_emoji.is_empty())
+                .map(|p| {
+                    let text = &p.status_emoji;
+                    if text.starts_with(':') {
+                        {
+                            let emoji = crate::demo::emoji(text.trim_matches(':'));
+                            if emoji.starts_with(':') {
+                                "💬".to_string()
+                            } else {
+                                emoji
+                            }
+                        }
+                    } else {
+                        safe_text(text)
+                    }
+                })
+                .unwrap_or_default();
+            let unread = app.unread_counts.get(&c.id).copied().unwrap_or(0) > 0;
+            let suffix = format!(
+                "{}{}",
+                if status.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {status}")
+                },
+                if unread { " ●" } else { "" }
+            );
+            let name = ellipsize(
+                &safe_text(name),
+                body.width.saturating_sub(4 + suffix.width() as u16) as usize,
+            );
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {symbol} "), Style::default().fg(color)),
+                Span::styled(
+                    name,
+                    Style::default()
+                        .fg(if unread || *index == app.channel {
+                            FG
+                        } else {
+                            MUTED
+                        })
+                        .add_modifier(if unread || *index == app.channel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(suffix, Style::default().fg(ACCENT)),
+            ]))
+        })
+        .collect();
+    let selected = if app.focus == Focus::People {
+        Some(app.person)
+    } else if app.conversations.get(app.channel).is_some_and(|c| c.is_im) {
+        Some(app.channel)
+    } else {
+        None
+    };
+    let manual_offset = ui.people.offset();
+    ui.people.select(if ui.manual_people_scroll {
+        None
+    } else {
+        selected.and_then(|i| people_ids.iter().position(|index| *index == i))
+    });
+    if ui.manual_people_scroll {
+        *ui.people.offset_mut() = manual_offset;
+    }
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().bg(SELECTED)),
+        body,
+        &mut ui.people,
+    );
+    for (row, index) in people_ids
+        .iter()
+        .skip(ui.people.offset())
+        .take(body.height as usize)
+        .enumerate()
+    {
+        ui.hits.push(Hit {
+            rect: Rect::new(body.x, body.y + row as u16, body.width, 1),
+            action: Action::Channel(*index),
+        });
+        let id = app.conversations[*index].user.clone();
+        if !id.is_empty() {
+            ui.visible_people.push(id);
         }
     }
     scrollbar(
         frame,
-        cols[0],
-        channel_rows.len(),
-        ui.channels.offset(),
-        inner.height as usize,
+        people,
+        people_ids.len(),
+        ui.people.offset(),
+        body.height as usize,
     );
+}
+
+fn thread_action(action: Action) -> Action {
+    match action {
+        Action::Message(i) | Action::ThreadAt(i) => Action::ThreadMessage(i),
+        Action::Attachment(m, a) => Action::ThreadAttachment(m, a),
+        Action::Reaction(m, r) => Action::ThreadReaction(m, r),
+        Action::Compose => Action::ThreadCompose,
+        Action::Send => Action::ThreadSend,
+        Action::Read => Action::ThreadRead,
+        Action::Refresh => Action::ThreadRefresh,
+        Action::Media => Action::ThreadMedia,
+        other => other,
+    }
+}
+
+fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread: bool) {
+    let hit_start = ui.hits.len();
+    let (messages, selected, editor, loading, sending) = if thread {
+        let Some(view) = app.thread_view.as_ref() else {
+            return;
+        };
+        (
+            &view.messages,
+            view.selected,
+            &view.editor,
+            view.loading,
+            view.sending,
+        )
+    } else {
+        (
+            &app.messages,
+            app.selected,
+            &app.editor,
+            app.loading,
+            app.sending,
+        )
+    };
+    let composing = app.mode == Mode::Compose
+        && if thread {
+            app.focus == Focus::Thread
+        } else {
+            app.focus == Focus::Messages
+        };
     let main = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(5),
     ])
-    .split(cols[1]);
+    .split(area);
     let title = app
         .conversations
         .get(app.channel)
         .map(|c| c.label())
         .unwrap_or_else(|| "Getting started".into());
-    let title = if app.thread.is_some() {
-        format!(" {title} / Thread ")
+    let title = if thread {
+        " Thread ".to_owned()
     } else {
         format!(" {title} ")
     };
@@ -441,27 +534,49 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         horizontal: 1,
         vertical: 1,
     });
-    toolbar(
-        frame,
-        ui,
-        title_inner,
-        &[
-            ("Refresh", Action::Refresh),
-            ("Thread", Action::Thread),
-            ("Media", Action::Media),
-            ("Read", Action::Read),
-            ("Back", Action::Back),
-        ],
-    );
-    ui.message_area = main[1];
+    if thread {
+        toolbar(
+            frame,
+            ui,
+            title_inner,
+            &[
+                ("Refresh", Action::Refresh),
+                ("Media", Action::Media),
+                ("Read", Action::Read),
+            ],
+        );
+        button(
+            frame,
+            ui,
+            Rect::new(area.right().saturating_sub(9), area.y, 9.min(area.width), 1),
+            "× Close",
+            Action::CloseThread,
+        );
+    } else {
+        toolbar(
+            frame,
+            ui,
+            title_inner,
+            &[
+                ("Refresh", Action::Refresh),
+                ("Thread", Action::Thread),
+                ("Media", Action::Media),
+                ("Read", Action::Read),
+            ],
+        );
+    }
+    if thread {
+        ui.thread_area = main[1];
+    } else {
+        ui.message_area = main[1];
+    }
     let width = main[1].width.saturating_sub(4).max(1) as usize;
     let mut heights = Vec::new();
     let mut attachment_rows = Vec::new();
     let mut preview_rows = Vec::new();
     let mut reaction_rows = Vec::new();
     let mut reply_rows = Vec::new();
-    let items: Vec<_> = app
-        .messages
+    let items: Vec<_> = messages
         .iter()
         .map(|m| {
             let author = app.users.get(&m.user).cloned().unwrap_or_else(|| {
@@ -583,24 +698,26 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
             ListItem::new(Text::from(lines))
         })
         .collect();
-    ui.messages.select(if app.messages.is_empty() {
+    let state = if thread {
+        &mut ui.thread_messages
+    } else {
+        &mut ui.messages
+    };
+    state.select(if messages.is_empty() {
         None
     } else {
-        Some(app.selected)
+        Some(selected)
     });
     frame.render_stateful_widget(
         List::new(items)
             .highlight_style(Style::default().bg(Color::Rgb(37, 25, 43)))
             .style(Style::default().fg(FG)),
         main[1],
-        &mut ui.messages,
+        state,
     );
+    let offset = state.offset();
     let content_lines: usize = heights.iter().map(|h| *h as usize).sum();
-    let scrolled_lines: usize = heights
-        .iter()
-        .take(ui.messages.offset())
-        .map(|h| *h as usize)
-        .sum();
+    let scrolled_lines: usize = heights.iter().take(offset).map(|h| *h as usize).sum();
     scrollbar(
         frame,
         main[1],
@@ -609,7 +726,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         main[1].height as usize,
     );
     let mut y = main[1].y;
-    for (index, height) in heights.iter().enumerate().skip(ui.messages.offset()) {
+    for (index, height) in heights.iter().enumerate().skip(offset) {
         let visible = (*height).min(main[1].bottom().saturating_sub(y));
         if visible == 0 {
             break;
@@ -659,9 +776,9 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         }
         y += visible;
     }
-    if app.messages.is_empty() {
+    if messages.is_empty() {
         frame.render_widget(
-            Paragraph::new(if app.loading {
+            Paragraph::new(if loading {
                 "Loading conversation…"
             } else {
                 "No messages to display."
@@ -671,9 +788,9 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
             main[1],
         );
     }
-    let hint = if app.sending {
+    let hint = if sending {
         "Sending…"
-    } else if app.mode == Mode::Compose {
+    } else if composing {
         "Enter to send · Alt+Enter for a new line"
     } else {
         "Click the message field to write"
@@ -687,15 +804,15 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         .get(app.channel)
         .map(|c| c.label())
         .unwrap_or_default();
-    let title = if app.thread.is_some() {
+    let title = if thread {
         " Reply to thread ".to_owned()
     } else {
         format!(" Message {conversation} ")
     };
-    let composer = border(safe_text(&title), app.mode == Mode::Compose);
+    let composer = border(safe_text(&title), composing);
     let mut composer_inner = composer.inner(main[3]);
     frame.render_widget(composer, main[3]);
-    if !app.editor.text.trim().is_empty() {
+    if !editor.text.trim().is_empty() {
         let send = Rect::new(
             composer_inner.right().saturating_sub(8),
             composer_inner.bottom().saturating_sub(1),
@@ -706,7 +823,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
             frame,
             ui,
             send,
-            if app.sending { "Sending" } else { " Send → " },
+            if sending { "Sending" } else { " Send → " },
             Action::Send,
         );
         composer_inner.height = composer_inner.height.saturating_sub(1);
@@ -715,12 +832,12 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         rect: composer_inner,
         action: Action::Compose,
     });
-    let text = if app.editor.text.is_empty() && app.mode != Mode::Compose {
+    let text = if editor.text.is_empty() && !composing {
         "Write a message…"
     } else {
-        &app.editor.text
+        &editor.text
     };
-    let before = &app.editor.text[..app.editor.cursor];
+    let before = &editor.text[..editor.cursor];
     let line_count = before.lines().count().max(1) + usize::from(before.ends_with('\n'));
     let scroll = line_count.saturating_sub(composer_inner.height as usize) as u16;
     let cursor_column = before.rsplit('\n').next().unwrap_or("").width() as u16;
@@ -728,10 +845,10 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     frame.render_widget(
         Paragraph::new(text)
             .scroll((scroll, horizontal))
-            .style(Style::default().fg(if app.mode == Mode::Compose { FG } else { MUTED })),
+            .style(Style::default().fg(if composing { FG } else { MUTED })),
         composer_inner,
     );
-    if app.mode == Mode::Compose && !composer_inner.is_empty() {
+    if composing && !composer_inner.is_empty() {
         let x = before.rsplit('\n').next().unwrap_or("").width() as u16;
         let y = (line_count as u16).saturating_sub(1).saturating_sub(scroll);
         frame.set_cursor_position((
@@ -740,6 +857,233 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
                     .min(composer_inner.width.saturating_sub(1)),
             composer_inner.y + y.min(composer_inner.height.saturating_sub(1)),
         ));
+    }
+    if thread {
+        for hit in &mut ui.hits[hit_start..] {
+            hit.action = thread_action(hit.action);
+        }
+    }
+}
+
+pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
+    let area = frame.area();
+    ui.bounds = area;
+    ui.thread_area = Rect::default();
+    ui.thread_divider = Rect::default();
+    ui.sidebar_divider = Rect::default();
+    ui.visible_people.clear();
+    ui.hits.clear();
+    ui.inline_images.clear();
+    ui.media_area = Rect::default();
+    frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
+    if area.width < 38 || area.height < 12 {
+        frame.render_widget(
+            Paragraph::new("Make the terminal at least 38 × 12.\nCtrl+C quits.")
+                .style(Style::default().fg(ACCENT)),
+            area,
+        );
+        return;
+    }
+    if let Some(viewer) = &app.viewer {
+        let chunks = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(area);
+        let name = &viewer.prepared.title;
+        frame.render_widget(
+            Paragraph::new(format!("  MEDIA / {}", safe_text(name)))
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            chunks[0],
+        );
+        ui.media_area = chunks[1].inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 0,
+        });
+        if viewer.last.is_none() {
+            frame.render_widget(
+                Paragraph::new(viewer.note.as_str())
+                    .centered()
+                    .style(Style::default().fg(MUTED)),
+                ui.media_area,
+            );
+        }
+        toolbar(
+            frame,
+            ui,
+            chunks[2],
+            &[
+                ("Esc Close", Action::Close),
+                (
+                    if viewer
+                        .video
+                        .as_ref()
+                        .is_some_and(|v| v.paused.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        "Space Resume"
+                    } else {
+                        "Space Pause"
+                    },
+                    Action::Pause,
+                ),
+            ],
+        );
+        return;
+    }
+    if app.mode == Mode::Read {
+        let popup = area.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let block = border(" Message · j/k or wheel scroll · Esc closes ", true);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+        let mut lines = Vec::new();
+        let mut attachment_lines = Vec::new();
+        let (messages, selected) = app.active_messages();
+        if let Some(message) = messages.get(selected) {
+            for line in display_text(app, &message.text).split('\n') {
+                lines.extend(
+                    textwrap::wrap(line, chunks[0].width.max(1) as usize)
+                        .into_iter()
+                        .map(|s| Line::from(s.into_owned())),
+                );
+            }
+            for (index, file) in message.files.iter().enumerate() {
+                if file.is_media() {
+                    attachment_lines.push((index, lines.len()));
+                }
+                lines.push(Line::from(Span::styled(
+                    format!(" ▧ {}", safe_text(&file.name)),
+                    Style::default().fg(GREEN),
+                )));
+            }
+        }
+        ui.read_scroll_max = lines.len().saturating_sub(chunks[0].height as usize);
+        let active_scroll = if app.focus == Focus::Thread {
+            app.thread_view.as_ref().map_or(0, |view| view.read_scroll)
+        } else {
+            app.read_scroll
+        };
+        let scroll = active_scroll.min(ui.read_scroll_max);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+                .style(Style::default().fg(FG)),
+            chunks[0],
+        );
+        toolbar(
+            frame,
+            ui,
+            chunks[1],
+            &[
+                ("Esc Close", Action::Close),
+                ("Thread", Action::Thread),
+                ("Media", Action::Media),
+            ],
+        );
+        scrollbar(
+            frame,
+            chunks[0],
+            ui.read_scroll_max + chunks[0].height as usize,
+            scroll,
+            chunks[0].height as usize,
+        );
+        for (index, row) in attachment_lines {
+            if row >= scroll && row < scroll + chunks[0].height as usize {
+                ui.hits.push(Hit {
+                    rect: Rect::new(
+                        chunks[0].x,
+                        chunks[0].y + (row - scroll) as u16,
+                        chunks[0].width,
+                        1,
+                    ),
+                    action: if app.focus == Focus::Thread {
+                        Action::ThreadAttachment(selected, index)
+                    } else {
+                        Action::Attachment(selected, index)
+                    },
+                });
+            }
+        }
+        if app.focus == Focus::Thread {
+            for hit in &mut ui.hits {
+                hit.action = thread_action(hit.action);
+            }
+            ui.thread_area = chunks[0];
+        } else {
+            ui.message_area = chunks[0];
+        }
+        return;
+    }
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(4),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let header = Layout::horizontal([Constraint::Min(10), Constraint::Length(28)]).split(rows[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  slacker  ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(safe_text(&app.workspace), Style::default().fg(MUTED)),
+        ])),
+        header[0],
+    );
+    toolbar(
+        frame,
+        ui,
+        header[1],
+        &[("Ctrl+K Jump", Action::Switch), ("? Help", Action::Help)],
+    );
+    let min_feed = if area.width >= 70 { 24 } else { 12 };
+    let min_sidebar = if area.width >= 70 { 16 } else { 12 };
+    let reserve = if app.thread_view.is_some() {
+        min_feed * 2 + 1
+    } else {
+        min_feed
+    };
+    let preferred = app.sidebar_width.unwrap_or((area.width / 4).clamp(22, 34));
+    let sidebar_width = preferred.clamp(
+        min_sidebar,
+        area.width.saturating_sub(reserve).max(min_sidebar),
+    );
+    let cols = [
+        Rect::new(rows[1].x, rows[1].y, sidebar_width, rows[1].height),
+        Rect::new(
+            rows[1].x + sidebar_width,
+            rows[1].y,
+            rows[1].width - sidebar_width,
+            rows[1].height,
+        ),
+    ];
+    draw_sidebar(frame, app, ui, cols[0]);
+    let content = cols[1];
+    if app.thread_view.is_some() && content.width >= 25 {
+        let minimum = if content.width >= 49 { 24 } else { 12 };
+        let width = app.thread_width.unwrap_or(content.width / 2).clamp(
+            minimum,
+            content.width.saturating_sub(minimum + 1).max(minimum),
+        );
+        let divider = Rect::new(content.right() - width - 1, content.y, 1, content.height);
+        let channel = Rect::new(content.x, content.y, divider.x - content.x, content.height);
+        let replies = Rect::new(divider.right(), content.y, width, content.height);
+        ui.thread_divider = divider;
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(ACCENT)),
+            divider,
+        );
+        draw_feed(frame, app, ui, channel, false);
+        draw_feed(frame, app, ui, replies, true);
+    } else {
+        draw_feed(frame, app, ui, content, false);
     }
     let mode = match app.mode {
         Mode::Compose => "Typing",
@@ -759,7 +1103,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         let block = border(" Keyboard & mouse ", true).style(Style::default().bg(PANEL));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
-        let help = "NAVIGATE\n j / k, ↑ / ↓    Select a message or conversation\n h / l, Tab      Focus conversations / messages\n Enter           Open conversation or selected thread\n Ctrl+K          Find a conversation (fuzzy search)\n g / G           First / last item\n PgUp / PgDown   More history / move five messages\n\nWRITE\n i               Compose   ·   Esc returns to navigation\n Enter           Send      ·   Alt+Enter adds a newline\n\nREAD & MEDIA\n o               Read full message (j/k or wheel scroll)\n t               Open selected message's thread\n v               View image / video attachment\n Space           Pause / resume video (silent playback)\n Esc             Close media, thread, or popup\n R               Refresh / retry connection\n q / Ctrl+C      Quit (q types normally while composing)\n\nMOUSE  Click channels, messages, composer, and buttons.\n       Wheel scrolls the list under the pointer.";
+        let help = "NAVIGATE\n j / k, ↑ / ↓    Select a message or conversation\n h / l, Tab      Cycle sidebar / channel / thread panes\n Enter           Open conversation or selected thread\n Ctrl+K          Find a conversation (fuzzy search)\n g / G           First / last item\n PgUp / PgDown   More history / move five messages\n\nWRITE\n i               Compose   ·   Esc returns to navigation\n Enter           Send      ·   Alt+Enter adds a newline\n\nREAD & MEDIA\n o               Read full message (j/k or wheel scroll)\n t               Open thread in the right pane\n v               View image / video attachment\n Space           Pause / resume video (silent playback)\n Esc             Close media, thread, or popup\n R               Refresh / retry connection\n q / Ctrl+C      Quit (q types normally while composing)\n\nMOUSE  Click channels, messages, composer, and buttons.\n       Wheel scrolls under the pointer; typing focus stays put.\n       Drag pane dividers to resize.\nPEOPLE ● Online · ○ Away · ⊘ Do not disturb · · Unknown";
         frame.render_widget(
             Paragraph::new(help)
                 .wrap(Wrap { trim: false })
@@ -825,8 +1169,59 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     }
 }
 
+pub fn key(app: &mut App, ui: &mut UiState, event: KeyEvent) {
+    let switching = app.mode == Mode::Switcher && event.code == KeyCode::Enter;
+    app.key(event);
+    if switching {
+        ui.manual_sidebar_scroll = false;
+        ui.manual_people_scroll = false;
+    }
+    if app.mode == Mode::Normal {
+        if app.focus == Focus::Channels {
+            ui.manual_sidebar_scroll = false;
+        }
+        if app.focus == Focus::People {
+            ui.manual_people_scroll = false;
+        }
+    }
+}
+
 pub fn mouse(app: &mut App, ui: &mut UiState, event: MouseEvent) {
     let point = Position::new(event.column, event.row);
+    let modal =
+        app.viewer.is_some() || matches!(app.mode, Mode::Help | Mode::Switcher | Mode::Read);
+    if event.kind == MouseEventKind::Up(MouseButton::Left) {
+        ui.dragging = None;
+        return;
+    }
+    if !modal
+        && event.kind == MouseEventKind::Drag(MouseButton::Left)
+        && let Some(divider) = ui.dragging
+    {
+        match divider {
+            Divider::Sidebar => {
+                app.sidebar_width = Some(event.column.saturating_sub(ui.bounds.x).saturating_add(1))
+            }
+            Divider::Thread => {
+                app.thread_width = Some(
+                    ui.bounds
+                        .right()
+                        .saturating_sub(event.column.saturating_add(1)),
+                )
+            }
+        }
+        return;
+    }
+    if !modal && event.kind == MouseEventKind::Down(MouseButton::Left) {
+        if ui.sidebar_divider.contains(point) {
+            ui.dragging = Some(Divider::Sidebar);
+            return;
+        }
+        if ui.thread_divider.contains(point) {
+            ui.dragging = Some(Divider::Thread);
+            return;
+        }
+    }
     if matches!(
         event.kind,
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -839,9 +1234,18 @@ pub fn mouse(app: &mut App, ui: &mut UiState, event: MouseEvent) {
         if app.viewer.is_some() || app.mode == Mode::Help {
             return;
         }
+        let compose_focus = (app.mode == Mode::Compose).then_some(app.focus);
         if app.mode == Mode::Read {
-            app.read_scroll = app
-                .read_scroll
+            let scroll = if app.focus == Focus::Thread {
+                if let Some(view) = &mut app.thread_view {
+                    &mut view.read_scroll
+                } else {
+                    &mut app.read_scroll
+                }
+            } else {
+                &mut app.read_scroll
+            };
+            *scroll = (*scroll)
                 .min(ui.read_scroll_max)
                 .saturating_add_signed(delta)
                 .min(ui.read_scroll_max);
@@ -850,12 +1254,53 @@ pub fn mouse(app: &mut App, ui: &mut UiState, event: MouseEvent) {
                 .switch_selected
                 .saturating_add_signed(delta)
                 .min(app.filtered().len().saturating_sub(1));
+        } else if ui.thread_area.contains(point) {
+            app.focus_thread();
+            app.move_selection(delta);
+        } else if ui.people_area.contains(point) {
+            if compose_focus.is_some() {
+                ui.manual_people_scroll = true;
+                let maximum = app
+                    .conversations
+                    .iter()
+                    .filter(|c| c.is_im)
+                    .count()
+                    .saturating_sub(ui.people_area.height.saturating_sub(2) as usize);
+                *ui.people.offset_mut() =
+                    ui.people.offset().saturating_add_signed(delta).min(maximum);
+            } else {
+                app.focus = Focus::People;
+                app.move_selection(delta);
+            }
         } else if ui.sidebar_area.contains(point) {
-            app.focus = Focus::Channels;
-            app.move_selection(delta);
+            if compose_focus.is_some() {
+                ui.manual_sidebar_scroll = true;
+                let maximum = app
+                    .conversations
+                    .iter()
+                    .filter(|c| !c.is_im)
+                    .count()
+                    .saturating_sub(
+                        ui.sidebar_area
+                            .height
+                            .saturating_sub(ui.people_area.height + 2)
+                            as usize,
+                    );
+                *ui.channels.offset_mut() = ui
+                    .channels
+                    .offset()
+                    .saturating_add_signed(delta)
+                    .min(maximum);
+            } else {
+                app.focus = Focus::Channels;
+                app.move_selection(delta);
+            }
         } else if ui.message_area.contains(point) {
-            app.focus = Focus::Messages;
+            app.focus_channel();
             app.move_selection(delta);
+        }
+        if let Some(focus) = compose_focus {
+            app.focus = focus;
         }
         return;
     }
@@ -863,40 +1308,101 @@ pub fn mouse(app: &mut App, ui: &mut UiState, event: MouseEvent) {
         return;
     }
     if let Some(hit) = ui.hits.iter().rev().find(|h| h.rect.contains(point)) {
+        let preview_focus = (app.mode == Mode::Compose
+            && matches!(
+                hit.action,
+                Action::Attachment(..)
+                    | Action::ThreadAttachment(..)
+                    | Action::Media
+                    | Action::ThreadMedia
+            ))
+        .then_some(app.focus);
         match hit.action {
-            Action::Channel(i) | Action::SwitchResult(i) => {
-                app.loading = false;
-                app.open_channel(i);
+            Action::Channel(index) | Action::SwitchResult(index) => {
+                ui.manual_sidebar_scroll = false;
+                ui.manual_people_scroll = false;
+                app.open_channel(index);
             }
-            Action::Message(i) => {
-                app.selected = i;
-                app.focus = Focus::Messages;
-            }
-            Action::ThreadAt(index) => {
+            Action::Message(index) => {
+                app.focus_channel();
                 app.selected = index;
                 app.mode = Mode::Normal;
+            }
+            Action::ThreadMessage(index) => {
+                app.focus_thread();
+                if let Some(view) = &mut app.thread_view {
+                    view.selected = index;
+                }
+                app.mode = Mode::Normal;
+            }
+            Action::ThreadAt(index) => {
+                app.focus_channel();
+                app.selected = index;
                 app.open_thread();
             }
-            Action::Reaction(message, reaction) => app.toggle_demo_reaction(message, reaction),
-            Action::Read => {
-                app.read_scroll = 0;
+            Action::Reaction(message, reaction) | Action::ThreadReaction(message, reaction) => {
+                let focus = app.focus;
+                if matches!(hit.action, Action::ThreadReaction(..)) {
+                    app.focus_thread();
+                } else {
+                    app.focus_channel();
+                }
+                app.toggle_demo_reaction(message, reaction);
+                app.focus = focus;
+            }
+            Action::Read | Action::ThreadRead => {
+                if hit.action == Action::ThreadRead {
+                    app.focus_thread();
+                    if let Some(view) = &mut app.thread_view {
+                        view.read_scroll = 0;
+                    }
+                } else {
+                    app.focus_channel();
+                    app.read_scroll = 0;
+                }
                 app.mode = Mode::Read;
             }
             Action::Attachment(message, index) => {
+                app.focus_channel();
                 app.selected = message;
                 app.open_attachment(index);
             }
-            Action::Compose => app.mode = Mode::Compose,
-            Action::Send => app.send(),
+            Action::ThreadAttachment(message, index) => {
+                app.focus_thread();
+                if let Some(view) = &mut app.thread_view {
+                    view.selected = message;
+                }
+                app.open_attachment(index);
+            }
+            Action::Compose => app.start_composing(false),
+            Action::ThreadCompose => app.start_composing(true),
+            Action::Send => {
+                app.start_composing(false);
+                app.send();
+            }
+            Action::ThreadSend => {
+                app.start_composing(true);
+                app.send();
+            }
             Action::Thread => {
-                app.mode = Mode::Normal;
+                app.focus_channel();
                 app.open_thread();
             }
-            Action::Media => app.open_media(),
+            Action::Media => {
+                app.focus_channel();
+                app.open_media();
+            }
+            Action::ThreadMedia => {
+                app.focus_thread();
+                app.open_media();
+            }
             Action::Switch => app.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
             Action::Help => app.mode = Mode::Help,
-            Action::Refresh => app.key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE)),
-            Action::Back => app.close_thread(),
+            Action::Refresh => {
+                app.refresh_channel(false);
+            }
+            Action::ThreadRefresh => app.refresh_thread(false),
+            Action::Back | Action::CloseThread => app.close_thread(),
             Action::Close => {
                 app.viewer = None;
                 app.mode = Mode::Normal;
@@ -906,6 +1412,9 @@ pub fn mouse(app: &mut App, ui: &mut UiState, event: MouseEvent) {
                     video.toggle();
                 }
             }
+        }
+        if let Some(focus) = preview_focus {
+            app.focus = focus;
         }
     }
 }

@@ -44,6 +44,8 @@ fn stale_history_cannot_replace_another_channel() {
     app.generation = 4;
     app.receive(Reply::History {
         id: 3,
+        channel: app.current_id().unwrap().into(),
+        thread: None,
         append: false,
         result: Ok(History {
             messages: vec![Message {
@@ -126,12 +128,13 @@ fn thread_reply_and_channel_drafts_are_isolated() {
     let mut app = App::demo(false);
     app.editor.insert("channel draft");
     app.open_thread();
-    assert!(app.editor.text.is_empty());
-    app.editor.insert("thread reply");
+    assert_eq!(app.editor.text, "channel draft");
+    assert!(app.active_editor().text.is_empty());
+    app.active_editor_mut().insert("thread reply");
     app.close_thread();
     assert_eq!(app.editor.text, "channel draft");
     app.open_thread();
-    assert_eq!(app.editor.text, "thread reply");
+    assert_eq!(app.active_editor().text, "thread reply");
 }
 
 #[test]
@@ -143,6 +146,8 @@ fn switching_channels_invalidates_inflight_history_even_when_loading() {
     app.open_channel(1);
     app.receive(Reply::History {
         id: previous,
+        channel: "D0".into(),
+        thread: None,
         append: false,
         result: Ok(History {
             messages: vec![Message {
@@ -187,9 +192,11 @@ fn thread_refresh_merges_replies_instead_of_discarding_loaded_history() {
     let mut app = App::demo(false);
     app.open_thread();
     app.demo = false;
-    let before = app.messages.len();
+    let before = app.thread_view.as_ref().unwrap().messages.len();
     app.receive(Reply::History {
-        id: app.generation,
+        id: app.thread_view.as_ref().unwrap().generation,
+        channel: app.current_id().unwrap().into(),
+        thread: app.thread.clone(),
         append: false,
         result: Ok(History {
             messages: vec![Message {
@@ -200,8 +207,15 @@ fn thread_refresh_merges_replies_instead_of_discarding_loaded_history() {
             cursor: String::new(),
         }),
     });
-    assert_eq!(app.messages.len(), before + 1);
-    assert!(app.messages.iter().any(|m| m.text == "new reply"));
+    assert_eq!(app.thread_view.as_ref().unwrap().messages.len(), before + 1);
+    assert!(
+        app.thread_view
+            .as_ref()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.text == "new reply")
+    );
 }
 
 #[test]
@@ -252,7 +266,9 @@ fn sent_reply_stays_visible_while_intermediate_thread_pages_are_loading() {
         }),
     });
     app.receive(Reply::History {
-        id: app.generation,
+        id: app.thread_view.as_ref().unwrap().generation,
+        channel: app.current_id().unwrap().into(),
+        thread: app.thread.clone(),
         append: true,
         result: Ok(History {
             messages: vec![Message {
@@ -263,15 +279,25 @@ fn sent_reply_stays_visible_while_intermediate_thread_pages_are_loading() {
             cursor: "more".into(),
         }),
     });
-    assert!(app.messages.iter().any(|m| m.text == "sent reply"));
-    assert_eq!(app.thread_latest.as_deref(), Some("1731000100.000001"));
+    assert!(
+        app.thread_view
+            .as_ref()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.text == "sent reply")
+    );
+    assert_eq!(
+        app.thread_view.as_ref().unwrap().latest.as_deref(),
+        Some("1731000100.000001")
+    );
 }
 
 #[test]
 fn grouped_sidebar_keeps_direct_messages_clickable_and_scrolls_to_selection() {
     let mut app = App::demo(false);
     let dm_index = app.conversations.len() - 1;
-    app.sidebar = dm_index;
+    app.person = dm_index;
     let mut ui = UiState::default();
     let mut terminal = Terminal::new(TestBackend::new(100, 22)).unwrap();
     terminal.draw(|f| ui::draw(f, &app, &mut ui)).unwrap();
@@ -282,7 +308,7 @@ fn grouped_sidebar_keeps_direct_messages_clickable_and_scrolls_to_selection() {
         .iter()
         .map(|c| c.symbol())
         .collect::<String>();
-    assert!(screen.contains("Direct messages"));
+    assert!(screen.contains("People"));
     assert!(screen.contains("Channels"));
     let rect = ui
         .hits
@@ -313,6 +339,8 @@ fn refresh_keeps_the_message_open_in_the_full_reader() {
     app.read_scroll = 7;
     app.receive(Reply::History {
         id: app.generation,
+        channel: app.current_id().unwrap().into(),
+        thread: None,
         append: false,
         result: Ok(History {
             messages: vec![Message {
@@ -325,4 +353,180 @@ fn refresh_keeps_the_message_open_in_the_full_reader() {
     });
     assert_eq!(app.messages[app.selected].ts, reading);
     assert_eq!(app.read_scroll, 7);
+}
+
+#[test]
+fn channel_and_thread_history_route_independently() {
+    let mut app = App::demo(false);
+    let original = app.messages[app.selected].ts.clone();
+    app.open_thread();
+    app.demo = false;
+    let channel = app.current_id().unwrap().to_owned();
+    let thread_generation = app.thread_view.as_ref().unwrap().generation;
+    app.receive(Reply::History {
+        id: app.generation,
+        channel: channel.clone(),
+        thread: None,
+        append: false,
+        result: Ok(History {
+            messages: vec![Message {
+                ts: "2000000000.000001".into(),
+                text: "channel update".into(),
+                ..Default::default()
+            }],
+            cursor: String::new(),
+        }),
+    });
+    assert_eq!(app.messages[0].text, "channel update");
+    assert_eq!(app.thread_view.as_ref().unwrap().messages[0].ts, original);
+    app.receive(Reply::History {
+        id: thread_generation,
+        channel,
+        thread: app.thread.clone(),
+        append: true,
+        result: Ok(History {
+            messages: vec![Message {
+                ts: "2000000001.000001".into(),
+                text: "thread update".into(),
+                ..Default::default()
+            }],
+            cursor: String::new(),
+        }),
+    });
+    assert_eq!(app.messages.len(), 1);
+    assert!(
+        app.thread_view
+            .as_ref()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.text == "thread update")
+    );
+}
+
+#[test]
+fn delayed_thread_send_does_not_clear_channel_draft_or_steal_focus() {
+    let mut app = App::demo(false);
+    app.editor.insert("channel draft");
+    app.open_thread();
+    app.active_editor_mut().insert("reply");
+    let channel = app.current_id().unwrap().to_owned();
+    let thread = app.thread.clone();
+    app.close_thread();
+    app.receive(Reply::Sent {
+        channel,
+        thread,
+        text: "reply".into(),
+        result: Ok(Message {
+            ts: "2000000000.000001".into(),
+            text: "reply".into(),
+            ..Default::default()
+        }),
+    });
+    assert_eq!(app.editor.text, "channel draft");
+    assert!(app.focus == Focus::Messages);
+    app.open_thread();
+    assert!(app.active_editor().text.is_empty());
+}
+
+#[test]
+fn reopening_a_thread_rejects_its_previous_history_response() {
+    let mut app = App::demo(false);
+    app.open_thread();
+    let old_generation = app.thread_view.as_ref().unwrap().generation;
+    let root = app.thread.clone();
+    app.close_thread();
+    app.open_thread();
+    app.receive(Reply::History {
+        id: old_generation,
+        channel: app.current_id().unwrap().into(),
+        thread: root,
+        append: true,
+        result: Ok(History {
+            messages: vec![Message {
+                ts: "2000000010.000001".into(),
+                text: "stale thread page".into(),
+                ..Default::default()
+            }],
+            cursor: "stale".into(),
+        }),
+    });
+    assert!(
+        !app.thread_view
+            .as_ref()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.text == "stale thread page")
+    );
+    assert!(app.thread_view.as_ref().unwrap().cursor.is_empty());
+}
+
+#[test]
+fn presence_is_deduplicated_capped_and_throttled_without_network_access() {
+    use slacker::{
+        api::{Presence, Slack},
+        app::{Job, Worker},
+    };
+    use std::sync::mpsc;
+    let (jobs, queued) = mpsc::channel();
+    let (events, replies) = mpsc::channel();
+    let worker = Worker {
+        jobs,
+        replies,
+        events,
+        slack: Slack::new("test-token".into()).unwrap(),
+    };
+    let mut app = App::demo(false);
+    app.demo = false;
+    app.worker = Some(worker);
+    let users: Vec<String> = (0..12).map(|i| format!("U{i}")).collect();
+    let mut duplicated = users.clone();
+    duplicated.insert(0, "U0".into());
+    app.refresh_presence(&duplicated);
+    let Job::Presence { users: requested } = queued.try_recv().unwrap() else {
+        panic!("expected presence request")
+    };
+    assert_eq!(requested.len(), 10);
+    app.refresh_presence(&users);
+    assert!(queued.try_recv().is_err());
+    let status = app.status.clone();
+    app.receive(Reply::Presence {
+        users: requested.clone(),
+        result: Err(anyhow::anyhow!("offline")),
+    });
+    assert_eq!(app.presences["U0"], Presence::Unknown);
+    assert_eq!(app.status, status);
+    app.refresh_presence(&requested);
+    assert!(queued.try_recv().is_err());
+    app.refresh_presence(&users);
+    let Job::Presence { users: remaining } = queued.try_recv().unwrap() else {
+        panic!("expected uncached users")
+    };
+    assert_eq!(remaining, vec!["U10", "U11"]);
+}
+
+#[test]
+fn unread_refresh_retains_previous_counts_on_error_and_is_throttled() {
+    use slacker::{
+        api::Slack,
+        app::{Job, Worker},
+    };
+    use std::sync::mpsc;
+    let (jobs, queued) = mpsc::channel();
+    let (events, replies) = mpsc::channel();
+    let mut app = App::demo(false);
+    app.demo = false;
+    app.worker = Some(Worker {
+        jobs,
+        replies,
+        events,
+        slack: Slack::new("test-token".into()).unwrap(),
+    });
+    app.refresh_unreads();
+    assert!(matches!(queued.try_recv().unwrap(), Job::Counts));
+    app.receive(Reply::Counts(Err(anyhow::anyhow!("offline"))));
+    assert_eq!(app.unread_counts["D1"], 2);
+    app.refresh_unreads();
+    assert!(queued.try_recv().is_err());
 }

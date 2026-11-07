@@ -1,5 +1,5 @@
 use crate::{
-    api::{Conversation, History, Message, Slack, Snapshot},
+    api::{Conversation, History, Message, Person, Presence, Slack, Snapshot},
     media::{Prepared, Video},
 };
 use anyhow::Result;
@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     sync::mpsc::{self, Receiver, Sender},
     thread,
+    time::{Duration, Instant},
 };
 
 #[derive(Default, Clone)]
@@ -100,10 +101,16 @@ pub enum Mode {
 pub enum Focus {
     Channels,
     Messages,
+    Thread,
+    People,
 }
 
 pub enum Job {
     Bootstrap,
+    Counts,
+    Presence {
+        users: Vec<String>,
+    },
     History {
         id: u64,
         channel: String,
@@ -120,8 +127,15 @@ pub enum Job {
 
 pub enum Reply {
     Bootstrap(Result<Snapshot>),
+    Counts(Result<HashMap<String, usize>>),
+    Presence {
+        users: Vec<String>,
+        result: Result<HashMap<String, Presence>>,
+    },
     History {
         id: u64,
+        channel: String,
+        thread: Option<String>,
         append: bool,
         result: Result<History>,
     },
@@ -152,6 +166,23 @@ impl Worker {
         thread::spawn(move || {
             for job in rx {
                 let reply = match job {
+                    Job::Counts => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        thread::spawn(move || {
+                            let _ = tx.send(Reply::Counts(client.unread_counts()));
+                        });
+                        continue;
+                    }
+                    Job::Presence { users } => {
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        thread::spawn(move || {
+                            let result = client.presences(&users);
+                            let _ = tx.send(Reply::Presence { users, result });
+                        });
+                        continue;
+                    }
                     Job::Bootstrap => Reply::Bootstrap(client.bootstrap()),
                     Job::History {
                         id,
@@ -168,6 +199,8 @@ impl Worker {
                             &cursor,
                             oldest.as_deref(),
                         ),
+                        channel,
+                        thread,
                     },
                     Job::Send {
                         channel,
@@ -222,6 +255,19 @@ impl Viewer {
     }
 }
 
+#[derive(Default)]
+pub struct ThreadView {
+    pub messages: Vec<Message>,
+    pub selected: usize,
+    pub editor: Editor,
+    pub cursor: String,
+    pub latest: Option<String>,
+    pub generation: u64,
+    pub loading: bool,
+    pub sending: bool,
+    pub read_scroll: usize,
+}
+
 pub struct App {
     pub notifications: crate::notifications::Notifications,
     pub demo_images: HashMap<String, crate::media::Pixels>,
@@ -229,14 +275,27 @@ pub struct App {
     pub workspace: String,
     pub me: String,
     pub users: HashMap<String, String>,
+    pub people: HashMap<String, Person>,
+    pub presences: HashMap<String, Presence>,
+    pub presence_loading: bool,
+    pub unread_counts: HashMap<String, usize>,
+    unread_loading: bool,
+    unread_checked: Option<Instant>,
+    presence_checked: HashMap<String, Instant>,
+    request_generation: u64,
+    pending_sends: HashMap<(String, Option<String>), String>,
+    sent_messages: HashMap<(String, Option<String>), Vec<Message>>,
     pub conversations: Vec<Conversation>,
     pub channel: usize,
     pub sidebar: usize,
+    pub person: usize,
+    pub sidebar_width: Option<u16>,
+    pub thread_width: Option<u16>,
     pub messages: Vec<Message>,
     pub selected: usize,
     pub read_scroll: usize,
     pub thread: Option<String>,
-    pub thread_latest: Option<String>,
+    pub thread_view: Option<ThreadView>,
     pub mode: Mode,
     pub focus: Focus,
     pub editor: Editor,
@@ -265,14 +324,27 @@ impl App {
             workspace: "slacker".into(),
             me: "you".into(),
             users: HashMap::new(),
+            people: HashMap::new(),
+            presences: HashMap::new(),
+            presence_loading: false,
+            unread_counts: HashMap::new(),
+            unread_loading: false,
+            unread_checked: None,
+            presence_checked: HashMap::new(),
+            request_generation: 0,
+            pending_sends: HashMap::new(),
+            sent_messages: HashMap::new(),
             conversations: Vec::new(),
             channel: 0,
             sidebar: 0,
+            person: 0,
+            sidebar_width: None,
+            thread_width: None,
             messages: Vec::new(),
             selected: 0,
             read_scroll: 0,
             thread: None,
-            thread_latest: None,
+            thread_view: None,
             mode: Mode::Normal,
             focus: Focus::Messages,
             editor: Editor::default(),
@@ -300,18 +372,58 @@ impl App {
             ("leo".into(), "Leo Rivera".into()),
             ("you".into(), "You".into()),
         ]);
+        app.people = app
+            .users
+            .iter()
+            .map(|(id, name)| {
+                (
+                    id.clone(),
+                    Person {
+                        display_name: name.clone(),
+                        status_emoji: if id == "maya" {
+                            ":coffee:".into()
+                        } else {
+                            String::new()
+                        },
+                        status_text: if id == "maya" {
+                            "Pairing after lunch".into()
+                        } else {
+                            String::new()
+                        },
+                        is_bot: false,
+                    },
+                )
+            })
+            .collect();
+        app.presences = HashMap::from([
+            ("maya".into(), Presence::Active),
+            ("leo".into(), Presence::Away),
+            ("you".into(), Presence::DoNotDisturb),
+        ]);
         app.conversations = [
             ("general", false),
             ("engineering", false),
             ("design", false),
             ("random", false),
             ("Maya Chen", true),
+            ("Leo Rivera", true),
+            ("You", true),
         ]
         .into_iter()
         .enumerate()
         .map(|(i, (name, is_im))| Conversation {
             id: format!("D{i}"),
             name: name.into(),
+            user: if is_im {
+                match name {
+                    "Maya Chen" => "maya",
+                    "Leo Rivera" => "leo",
+                    _ => "you",
+                }
+                .into()
+            } else {
+                String::new()
+            },
             is_im,
             is_member: true,
             ..Default::default()
@@ -320,25 +432,33 @@ impl App {
         if graphics {
             app.demo_images = crate::demo::previews();
         }
+        app.person = app.conversations.iter().position(|c| c.is_im).unwrap_or(0);
+        app.unread_counts = HashMap::from([("D1".into(), 2), ("D3".into(), 1)]);
         app.load_demo();
         app
     }
     fn load_demo(&mut self) {
         let channel = self.current_id().unwrap_or("").to_owned();
-        let key = (channel.clone(), self.thread.clone());
-        self.messages = self.demo_saved.get(&key).cloned().unwrap_or_else(|| {
-            if let Some(ts) = &self.thread {
-                self.demo_saved
-                    .get(&(channel, None))
-                    .and_then(|messages| messages.iter().find(|m| m.ts == *ts))
-                    .cloned()
-                    .map(crate::demo::thread)
-                    .unwrap_or_default()
-            } else {
-                crate::demo::messages()
-            }
-        });
-        self.selected = self.messages.len().saturating_sub(1);
+        let previous = self.messages.get(self.selected).map(|m| m.ts.clone());
+        self.messages = self
+            .demo_saved
+            .get(&(channel, None))
+            .cloned()
+            .unwrap_or_else(|| {
+                crate::demo::messages_for(
+                    self.conversations
+                        .get(self.channel)
+                        .map_or("general", |c| c.name.as_str()),
+                )
+            });
+        self.selected = previous
+            .and_then(|ts| self.messages.iter().position(|m| m.ts == ts))
+            .or_else(|| {
+                self.messages
+                    .iter()
+                    .position(|m| m.files.iter().any(|f| f.is_media()))
+            })
+            .unwrap_or_else(|| self.messages.len().saturating_sub(1));
         self.status = "Demo · messages stay on this device".into();
     }
     fn save_demo_messages(&mut self) {
@@ -346,30 +466,135 @@ impl App {
             return;
         }
         if let Some(channel) = self.current_id().map(str::to_owned) {
-            self.demo_saved.insert(
-                (channel.clone(), self.thread.clone()),
-                self.messages.clone(),
-            );
-            if self.thread.is_none() {
-                for parent in &self.messages {
-                    if let Some(thread) = self
-                        .demo_saved
-                        .get_mut(&(channel.clone(), Some(parent.ts.clone())))
-                        && let Some(root) = thread.first_mut()
-                    {
-                        *root = parent.clone();
+            if let (Some(ts), Some(view)) = (&self.thread, &mut self.thread_view) {
+                if let Some(parent) = self.messages.iter_mut().find(|m| m.ts == *ts) {
+                    parent.reply_count = view.messages.len().saturating_sub(1);
+                    if let Some(root) = view.messages.first() {
+                        parent.reactions = root.reactions.clone();
                     }
                 }
+                self.demo_saved
+                    .insert((channel.clone(), Some(ts.clone())), view.messages.clone());
             }
-            if let Some(ts) = &self.thread
-                && let Some(messages) = self.demo_saved.get_mut(&(channel, None))
-                && let Some(parent) = messages.iter_mut().find(|m| m.ts == *ts)
-            {
-                parent.reply_count = self.messages.len().saturating_sub(1);
-                if let Some(root) = self.messages.first() {
-                    parent.reactions = root.reactions.clone();
+            self.demo_saved
+                .insert((channel.clone(), None), self.messages.clone());
+            for parent in &self.messages {
+                if let Some(thread) = self
+                    .demo_saved
+                    .get_mut(&(channel.clone(), Some(parent.ts.clone())))
+                    && let Some(root) = thread.first_mut()
+                {
+                    *root = parent.clone();
                 }
             }
+        }
+    }
+    pub fn active_editor(&self) -> &Editor {
+        if self.focus == Focus::Thread
+            && let Some(view) = &self.thread_view
+        {
+            return &view.editor;
+        }
+        &self.editor
+    }
+    pub fn active_editor_mut(&mut self) -> &mut Editor {
+        if self.focus == Focus::Thread
+            && let Some(view) = &mut self.thread_view
+        {
+            return &mut view.editor;
+        }
+        &mut self.editor
+    }
+    pub fn active_messages(&self) -> (&[Message], usize) {
+        if self.focus == Focus::Thread
+            && let Some(view) = &self.thread_view
+        {
+            return (&view.messages, view.selected);
+        }
+        (&self.messages, self.selected)
+    }
+    pub fn active_sending(&self) -> bool {
+        if self.focus == Focus::Thread
+            && let Some(view) = &self.thread_view
+        {
+            return view.sending;
+        }
+        self.sending
+    }
+    pub fn focus_channel(&mut self) {
+        self.focus = Focus::Messages;
+    }
+    pub fn focus_thread(&mut self) {
+        if self.thread_view.is_some() {
+            self.focus = Focus::Thread;
+        }
+    }
+    pub fn start_composing(&mut self, thread: bool) {
+        if thread {
+            self.focus_thread();
+        } else {
+            self.focus_channel();
+        }
+        self.mode = Mode::Compose;
+    }
+    fn next_request(&mut self) -> u64 {
+        self.request_generation = self.request_generation.max(self.generation) + 1;
+        self.request_generation
+    }
+    pub fn refresh_unreads(&mut self) {
+        if self.demo
+            || self.unread_loading
+            || self.conversations.is_empty()
+            || self
+                .unread_checked
+                .is_some_and(|checked| checked.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        if let Some(worker) = &self.worker
+            && worker.jobs.send(Job::Counts).is_ok()
+        {
+            self.unread_loading = true;
+            self.unread_checked = Some(Instant::now());
+        }
+    }
+    pub fn refresh_presence(&mut self, users: &[String]) {
+        if self.demo || self.presence_loading {
+            return;
+        }
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let mut requested = Vec::new();
+        let now = Instant::now();
+        for user in users {
+            if requested.len() == 10 {
+                break;
+            }
+            if !user.is_empty()
+                && !requested.contains(user)
+                && self
+                    .presence_checked
+                    .get(user)
+                    .is_none_or(|checked| now.duration_since(*checked) >= Duration::from_secs(60))
+            {
+                requested.push(user.clone());
+            }
+        }
+        if requested.is_empty() {
+            return;
+        }
+        if worker
+            .jobs
+            .send(Job::Presence {
+                users: requested.clone(),
+            })
+            .is_ok()
+        {
+            for user in requested {
+                self.presence_checked.insert(user, now);
+            }
+            self.presence_loading = true;
         }
     }
     pub fn current_id(&self) -> Option<&str> {
@@ -389,125 +614,223 @@ impl App {
         self.save_demo_messages();
         if let Some(id) = self.current_id().map(str::to_owned) {
             self.drafts
-                .insert((id, self.thread.clone()), std::mem::take(&mut self.editor));
-        }
-    }
-    fn restore_draft(&mut self) {
-        if let Some(id) = self.current_id().map(str::to_owned) {
-            self.editor = self
-                .drafts
-                .remove(&(id, self.thread.clone()))
-                .unwrap_or_default();
+                .insert((id.clone(), None), std::mem::take(&mut self.editor));
+            if let (Some(root), Some(view)) = (&self.thread, &mut self.thread_view) {
+                self.drafts
+                    .insert((id, Some(root.clone())), std::mem::take(&mut view.editor));
+            }
         }
     }
     pub fn open_channel(&mut self, index: usize) {
         if index >= self.conversations.len() {
             return;
         }
-        self.generation += 1;
-        self.media_generation += 1;
-        self.loading = false;
         self.save_draft();
+        self.generation = self.next_request();
+        self.media_generation += 1;
         self.channel = index;
-        self.sidebar = index;
+        if self.conversations[index].is_im {
+            self.person = index;
+        } else {
+            self.sidebar = index;
+        }
         self.thread = None;
-        self.thread_latest = None;
-        self.restore_draft();
+        self.thread_view = None;
+        let key = (self.current_id().unwrap_or("").to_owned(), None);
+        self.editor = self.drafts.remove(&key).unwrap_or_default();
+        self.sending = self.pending_sends.contains_key(&key);
         self.mode = Mode::Normal;
         self.focus = Focus::Messages;
         self.messages.clear();
         self.selected = 0;
+        self.read_scroll = 0;
+        self.loading = false;
         self.cursor.clear();
-        self.refresh(false);
+        self.refresh_channel(false);
     }
     pub fn refresh(&mut self, older: bool) {
+        if self.focus == Focus::Thread && self.thread_view.is_some() {
+            self.refresh_thread(older);
+        } else {
+            self.refresh_channel(older);
+        }
+    }
+    pub fn refresh_channel(&mut self, older: bool) {
         if self.demo {
+            if !self.messages.is_empty() {
+                self.save_demo_messages();
+            }
             self.load_demo();
             return;
         }
         if self.loading {
             return;
         }
-        if let (Some(id), Some(worker)) = (self.current_id().map(str::to_owned), &self.worker) {
-            self.generation += 1;
-            let _ = worker.jobs.send(Job::History {
-                id: self.generation,
-                channel: id.to_owned(),
-                thread: self.thread.clone(),
-                oldest: if self.thread.is_some() {
-                    self.thread_latest.clone()
-                } else {
-                    None
-                },
-                cursor: if older && self.thread.is_none() {
-                    self.cursor.clone()
-                } else {
-                    String::new()
-                },
-            });
+        let Some(channel) = self.current_id().map(str::to_owned) else {
+            return;
+        };
+        if self.worker.is_none() {
+            return;
+        }
+        self.generation = self.next_request();
+        let job = Job::History {
+            id: self.generation,
+            channel,
+            thread: None,
+            oldest: None,
+            cursor: if older {
+                self.cursor.clone()
+            } else {
+                String::new()
+            },
+        };
+        if self.worker.as_ref().unwrap().jobs.send(job).is_ok() {
             self.loading = true;
             self.status = "Loading messages…".into();
         }
     }
-    pub fn open_thread(&mut self) {
-        if self.thread.is_some() {
+    pub fn refresh_thread(&mut self, older: bool) {
+        if self.demo {
             return;
         }
-        if let Some(message) = self.messages.get(self.selected) {
-            let ts = message.ts.clone();
-            self.save_draft();
-            self.thread = Some(ts);
-            self.thread_latest = None;
-            self.restore_draft();
-            self.loading = false;
-            self.messages.clear();
-            self.cursor.clear();
-            self.selected = 0;
-            if self.demo {
-                self.load_demo();
-            } else {
-                self.refresh(false);
-            }
+        let (Some(channel), Some(root), Some(view), Some(_)) = (
+            self.current_id().map(str::to_owned),
+            self.thread.clone(),
+            self.thread_view.as_ref(),
+            self.worker.as_ref(),
+        ) else {
+            return;
+        };
+        if view.loading {
+            return;
         }
+        let cursor = if older {
+            view.cursor.clone()
+        } else {
+            String::new()
+        };
+        let oldest = if older { None } else { view.latest.clone() };
+        let id = self.next_request();
+        if self
+            .worker
+            .as_ref()
+            .unwrap()
+            .jobs
+            .send(Job::History {
+                id,
+                channel,
+                thread: Some(root),
+                cursor,
+                oldest,
+            })
+            .is_ok()
+        {
+            let view = self.thread_view.as_mut().unwrap();
+            view.generation = id;
+            view.loading = true;
+        }
+    }
+    pub fn open_thread(&mut self) {
+        let Some(parent) = self.messages.get(self.selected).cloned() else {
+            return;
+        };
+        if self.thread.as_deref() == Some(&parent.ts) {
+            self.start_composing(true);
+            return;
+        }
+        self.close_thread();
+        self.save_demo_messages();
+        let channel = self.current_id().unwrap_or("").to_owned();
+        let key = (channel, Some(parent.ts.clone()));
+        let mut messages = if self.demo {
+            self.demo_saved
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| crate::demo::thread(parent.clone()))
+        } else {
+            vec![parent.clone()]
+        };
+        if let Some(root) = messages.first_mut() {
+            *root = parent.clone();
+        }
+        self.thread = Some(parent.ts);
+        let generation = self.next_request();
+        self.thread_view = Some(ThreadView {
+            selected: 0,
+            messages,
+            editor: self.drafts.remove(&key).unwrap_or_default(),
+            generation,
+            sending: self.pending_sends.contains_key(&key),
+            ..Default::default()
+        });
+        self.start_composing(true);
+        self.refresh_thread(false);
     }
     pub fn close_thread(&mut self) {
-        if self.thread.is_some() {
-            self.open_channel(self.channel);
+        self.save_demo_messages();
+        if let (Some(channel), Some(root), Some(view)) = (
+            self.current_id().map(str::to_owned),
+            self.thread.take(),
+            self.thread_view.take(),
+        ) {
+            self.drafts.insert((channel, Some(root)), view.editor);
         }
+        self.mode = Mode::Compose;
+        self.focus = Focus::Messages;
     }
     pub fn send(&mut self) {
-        if self.sending || self.editor.text.trim().is_empty() {
+        if self.active_sending() || self.active_editor().text.trim().is_empty() {
             return;
         }
+        let thread = if self.focus == Focus::Thread {
+            self.thread.clone()
+        } else {
+            None
+        };
+        let text = self.active_editor().text.clone();
         if self.demo {
-            self.messages.push(Message {
-                ts: format!("demo-{}", self.messages.len()),
+            let message = Message {
+                ts: format!("demo-{}", self.next_request()),
                 user: self.me.clone(),
-                text: std::mem::take(&mut self.editor.text),
+                text,
                 ..Default::default()
-            });
-            self.editor.cursor = 0;
-            self.selected = self.messages.len() - 1;
-            self.mode = Mode::Normal;
+            };
+            *self.active_editor_mut() = Editor::default();
+            if let Some(view) = self.thread_view.as_mut().filter(|_| thread.is_some()) {
+                view.messages.push(message);
+                view.selected = view.messages.len() - 1;
+            } else {
+                self.messages.push(message);
+                self.selected = self.messages.len() - 1;
+            }
+            self.mode = Mode::Compose;
             self.status = "Message sent · demo only".into();
             self.save_demo_messages();
             return;
         }
         if let (Some(channel), Some(worker)) = (self.current_id().map(str::to_owned), &self.worker)
+            && worker
+                .jobs
+                .send(Job::Send {
+                    channel: channel.clone(),
+                    thread: thread.clone(),
+                    text: text.clone(),
+                })
+                .is_ok()
         {
-            let _ = worker.jobs.send(Job::Send {
-                channel: channel.to_owned(),
-                thread: self.thread.clone(),
-                text: self.editor.text.clone(),
-            });
-            self.sending = true;
+            self.pending_sends.insert((channel, thread.clone()), text);
+            if let Some(view) = self.thread_view.as_mut().filter(|_| thread.is_some()) {
+                view.sending = true;
+            } else {
+                self.sending = true;
+            }
             self.status = "Sending…".into();
         }
     }
     pub fn open_media(&mut self) {
-        let index = self
-            .messages
-            .get(self.selected)
+        let (messages, selected) = self.active_messages();
+        let index = messages
+            .get(selected)
             .and_then(|m| m.files.iter().position(|f| f.is_media()))
             .unwrap_or(0);
         self.open_attachment(index);
@@ -518,9 +841,9 @@ impl App {
                 "Kitty graphics unavailable; use a compatible terminal or --graphics kitty".into();
             return;
         }
-        let file = self
-            .messages
-            .get(self.selected)
+        let (messages, selected) = self.active_messages();
+        let file = messages
+            .get(selected)
             .and_then(|m| m.files.get(index).filter(|f| f.is_media()))
             .cloned();
         if self.demo {
@@ -556,8 +879,13 @@ impl App {
         if !self.demo {
             return;
         }
-        if let Some(reaction) = self
-            .messages
+        let in_thread = self.focus == Focus::Thread;
+        let messages = if in_thread {
+            &mut self.thread_view.as_mut().unwrap().messages
+        } else {
+            &mut self.messages
+        };
+        if let Some(reaction) = messages
             .get_mut(message)
             .and_then(|m| m.reactions.get_mut(reaction))
         {
@@ -567,6 +895,14 @@ impl App {
             } else {
                 reaction.users.push(self.me.clone());
                 reaction.count += 1;
+            }
+            if !in_thread
+                && let Some(view) = &mut self.thread_view
+                && let Some(parent) = self.messages.get(message)
+                && self.thread.as_deref() == Some(&parent.ts)
+                && let Some(root) = view.messages.first_mut()
+            {
+                *root = parent.clone();
             }
             self.save_demo_messages();
         }
@@ -580,7 +916,14 @@ impl App {
                         self.workspace = data.workspace;
                         self.me = data.me;
                         self.users = data.users;
+                        self.people = data.people;
                         self.conversations = data.conversations;
+                        self.sidebar = self
+                            .conversations
+                            .iter()
+                            .position(|c| !c.is_im)
+                            .unwrap_or(0);
+                        self.person = self.conversations.iter().position(|c| c.is_im).unwrap_or(0);
                         if self.conversations.is_empty() {
                             self.status =
                                 "No conversations. Check Slack scopes and channel membership."
@@ -592,13 +935,51 @@ impl App {
                     Err(e) => self.status = format!("{e:#} • R retries connection"),
                 }
             }
-            Reply::History { id, append, result } if id == self.generation => {
-                self.loading = false;
+            Reply::Counts(result) => {
+                self.unread_loading = false;
+                if let Ok(counts) = result {
+                    self.unread_counts = counts;
+                }
+            }
+            Reply::Presence { users, result } => {
+                self.presence_loading = false;
+                let values = result.unwrap_or_default();
+                for user in users {
+                    self.presences
+                        .insert(user.clone(), values.get(&user).copied().unwrap_or_default());
+                }
+            }
+            Reply::History {
+                id,
+                channel,
+                thread,
+                append,
+                result,
+            } => {
+                if self.current_id() != Some(channel.as_str()) {
+                    return;
+                }
+                if let Some(root) = &thread {
+                    if self.thread.as_ref() != Some(root) {
+                        return;
+                    }
+                    let Some(view) = &mut self.thread_view else {
+                        return;
+                    };
+                    if id != view.generation {
+                        return;
+                    }
+                    view.loading = false;
+                } else {
+                    if id != self.generation {
+                        return;
+                    }
+                    self.loading = false;
+                }
                 match result {
-                    Ok(history) => {
-                        if self.thread.is_none()
-                            && let Some(channel) = self.current_id().map(str::to_owned)
-                        {
+                    Ok(mut history) => {
+                        let latest = history.messages.last().map(|m| m.ts.clone());
+                        if thread.is_none() {
                             self.notifications.observe(
                                 &channel,
                                 &history.messages,
@@ -606,72 +987,99 @@ impl App {
                                 append,
                             );
                         }
-                        let selected_ts = self.messages.get(self.selected).map(|m| m.ts.clone());
-                        if self.thread.is_some()
-                            && let Some(last) = history.messages.last()
-                        {
-                            self.thread_latest = Some(last.ts.clone());
+                        if let Some(sent) = self.sent_messages.get_mut(&(channel, thread.clone())) {
+                            sent.retain(|message| {
+                                !history.messages.iter().any(|m| m.ts == message.ts)
+                            });
+                            history.messages.extend(sent.iter().cloned());
                         }
-                        if append || self.thread.is_some() {
-                            self.messages.extend(history.messages);
-                            self.messages.sort_by(|a, b| a.ts.cmp(&b.ts));
-                            self.messages.dedup_by(|a, b| a.ts == b.ts);
+                        let (messages, selected, cursor) = if thread.is_some() {
+                            let view = self.thread_view.as_mut().unwrap();
+                            if latest.is_some() {
+                                view.latest = latest;
+                            }
+                            (&mut view.messages, &mut view.selected, &mut view.cursor)
+                        } else {
+                            (&mut self.messages, &mut self.selected, &mut self.cursor)
+                        };
+                        let selected_ts = messages.get(*selected).map(|m| m.ts.clone());
+                        if append || thread.is_some() {
+                            messages.extend(history.messages);
                         } else {
                             let reading = (self.mode == Mode::Read)
-                                .then(|| self.messages.get(self.selected).cloned())
+                                .then(|| messages.get(*selected).cloned())
                                 .flatten();
-                            self.messages = history.messages;
+                            *messages = history.messages;
                             if let Some(reading) = reading
-                                && !self.messages.iter().any(|message| message.ts == reading.ts)
+                                && !messages.iter().any(|m| m.ts == reading.ts)
                             {
-                                self.messages.push(reading);
-                                self.messages.sort_by(|a, b| a.ts.cmp(&b.ts));
+                                messages.push(reading);
                             }
                         }
-                        self.cursor = history.cursor;
-                        self.selected = selected_ts
-                            .and_then(|ts| self.messages.iter().position(|m| m.ts == ts))
-                            .unwrap_or_else(|| self.messages.len().saturating_sub(1));
-                        self.status = if self.cursor.is_empty() {
-                            "Updated • R refresh • ? shortcuts".into()
-                        } else {
-                            "Updated • PgUp loads more • R refresh".into()
-                        };
+                        messages.sort_by(|a, b| a.ts.cmp(&b.ts));
+                        messages.dedup_by(|a, b| a.ts == b.ts);
+                        *cursor = history.cursor;
+                        *selected = selected_ts
+                            .and_then(|ts| messages.iter().position(|m| m.ts == ts))
+                            .unwrap_or_else(|| messages.len().saturating_sub(1));
+                        self.status = "Updated • R refresh • ? shortcuts".into();
                     }
                     Err(e) => self.status = format!("{e:#}"),
                 }
             }
-            Reply::History { .. } => {}
             Reply::Sent {
                 channel,
                 thread,
                 text,
                 result,
             } => {
-                self.sending = false;
+                self.pending_sends
+                    .remove(&(channel.clone(), thread.clone()));
+                let same_channel = self.current_id() == Some(channel.as_str());
+                let same_thread = same_channel && thread.is_some() && self.thread == thread;
+                if same_channel && thread.is_none() {
+                    self.sending = false;
+                }
+                if same_thread && let Some(view) = &mut self.thread_view {
+                    view.sending = false;
+                }
                 match result {
                     Ok(mut message) => {
-                        if self.current_id() == Some(&channel) && self.thread == thread {
-                            if self.editor.text == text {
-                                self.editor = Editor::default();
+                        if message.user.is_empty() {
+                            message.user = self.me.clone();
+                        }
+                        self.sent_messages
+                            .entry((channel.clone(), thread.clone()))
+                            .or_default()
+                            .push(message.clone());
+                        let target = if same_thread {
+                            self.thread_view.as_mut().map(|view| {
+                                (&mut view.editor, &mut view.messages, &mut view.selected)
+                            })
+                        } else if same_channel && thread.is_none() {
+                            Some((&mut self.editor, &mut self.messages, &mut self.selected))
+                        } else {
+                            None
+                        };
+                        if let Some((editor, messages, selected)) = target {
+                            if editor.text == text {
+                                *editor = Editor::default();
                             }
-                            self.mode = Mode::Normal;
-                            self.loading = false;
-                            self.refresh(false);
-                            if message.user.is_empty() {
-                                message.user = self.me.clone();
+                            if !messages.iter().any(|m| m.ts == message.ts) {
+                                messages.push(message);
+                                messages.sort_by(|a, b| a.ts.cmp(&b.ts));
                             }
-                            if !self.messages.iter().any(|m| m.ts == message.ts) {
-                                self.messages.push(message);
+                            *selected = messages.len().saturating_sub(1);
+                        } else {
+                            let key = (channel, thread);
+                            if self.drafts.get(&key).is_some_and(|d| d.text == text) {
+                                self.drafts.remove(&key);
                             }
-                            self.messages.sort_by(|a, b| a.ts.cmp(&b.ts));
-                            self.selected = self.messages.len().saturating_sub(1);
-                        } else if self
-                            .drafts
-                            .get(&(channel.clone(), thread.clone()))
-                            .is_some_and(|d| d.text == text)
-                        {
-                            self.drafts.remove(&(channel, thread));
+                            if let Some(messages) = self.demo_saved.get_mut(&key)
+                                && !messages.iter().any(|m| m.ts == message.ts)
+                            {
+                                messages.push(message);
+                            }
                         }
                         self.status = "Message sent".into();
                     }
@@ -701,8 +1109,33 @@ impl App {
         }
     }
     pub fn move_selection(&mut self, delta: isize) {
-        let (selected, len) = if self.focus == Focus::Channels {
-            (&mut self.sidebar, self.conversations.len())
+        if matches!(self.focus, Focus::Channels | Focus::People) {
+            let is_im = self.focus == Focus::People;
+            let indices: Vec<_> = self
+                .conversations
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_im == is_im)
+                .map(|(i, _)| i)
+                .collect();
+            let selected = if is_im {
+                &mut self.person
+            } else {
+                &mut self.sidebar
+            };
+            if let Some(position) = indices.iter().position(|i| i == selected) {
+                *selected = indices[position
+                    .saturating_add_signed(delta)
+                    .min(indices.len().saturating_sub(1))];
+            } else if let Some(first) = indices.first() {
+                *selected = *first;
+            }
+            return;
+        }
+        let (selected, len) = if self.focus == Focus::Thread
+            && let Some(view) = &mut self.thread_view
+        {
+            (&mut view.selected, view.messages.len())
         } else {
             (&mut self.selected, self.messages.len())
         };
@@ -730,17 +1163,20 @@ impl App {
             return;
         }
         if self.mode == Mode::Read {
+            let read_scroll = if self.focus == Focus::Thread
+                && let Some(view) = &mut self.thread_view
+            {
+                &mut view.read_scroll
+            } else {
+                &mut self.read_scroll
+            };
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.read_scroll = self.read_scroll.saturating_add(1)
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.read_scroll = self.read_scroll.saturating_sub(1)
-                }
-                KeyCode::PageDown => self.read_scroll = self.read_scroll.saturating_add(10),
-                KeyCode::PageUp => self.read_scroll = self.read_scroll.saturating_sub(10),
-                KeyCode::Home | KeyCode::Char('g') => self.read_scroll = 0,
+                KeyCode::Char('j') | KeyCode::Down => *read_scroll = read_scroll.saturating_add(1),
+                KeyCode::Char('k') | KeyCode::Up => *read_scroll = read_scroll.saturating_sub(1),
+                KeyCode::PageDown => *read_scroll = read_scroll.saturating_add(10),
+                KeyCode::PageUp => *read_scroll = read_scroll.saturating_sub(10),
+                KeyCode::Home | KeyCode::Char('g') => *read_scroll = 0,
                 KeyCode::Char('v') => self.open_media(),
                 KeyCode::Char('t') => {
                     self.mode = Mode::Normal;
@@ -769,10 +1205,10 @@ impl App {
             Mode::Compose => match key.code {
                 KeyCode::Esc => self.mode = Mode::Normal,
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.editor.insert("\n")
+                    self.active_editor_mut().insert("\n")
                 }
                 KeyCode::Enter => self.send(),
-                _ if !self.sending => self.editor.key(key),
+                _ if !self.active_sending() => self.active_editor_mut().key(key),
                 _ => {}
             },
             Mode::Switcher => match key.code {
@@ -797,20 +1233,30 @@ impl App {
                 KeyCode::Char('q') => self.quit = true,
                 KeyCode::Char('?') | KeyCode::F(1) => self.mode = Mode::Help,
                 KeyCode::Char('o') => {
-                    self.read_scroll = 0;
+                    if self.focus == Focus::Thread
+                        && let Some(view) = &mut self.thread_view
+                    {
+                        view.read_scroll = 0;
+                    } else {
+                        self.read_scroll = 0;
+                    }
                     self.mode = Mode::Read;
                 }
-                KeyCode::Char('i') => self.mode = Mode::Compose,
+                KeyCode::Char('i') => self.start_composing(self.focus == Focus::Thread),
                 KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
                 KeyCode::Char('h') => self.focus = Focus::Channels,
                 KeyCode::Char('l') => self.focus = Focus::Messages,
                 KeyCode::Tab | KeyCode::BackTab => {
-                    self.focus = if self.focus == Focus::Channels {
-                        Focus::Messages
-                    } else {
-                        Focus::Channels
+                    self.focus = match self.focus {
+                        Focus::Channels => Focus::People,
+                        Focus::People => Focus::Messages,
+                        Focus::Messages if self.thread_view.is_some() => Focus::Thread,
+                        _ => Focus::Channels,
                     }
+                }
+                KeyCode::Enter if self.focus == Focus::People => {
+                    self.open_channel(self.person);
                 }
                 KeyCode::Enter if self.focus == Focus::Channels => {
                     self.loading = false;
@@ -819,18 +1265,10 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('t') => self.open_thread(),
                 KeyCode::Char('v') => self.open_media(),
                 KeyCode::Char('g') | KeyCode::Home => {
-                    if self.focus == Focus::Channels {
-                        self.sidebar = 0;
-                    } else {
-                        self.selected = 0;
-                    }
+                    self.move_selection(isize::MIN);
                 }
                 KeyCode::Char('G') | KeyCode::End => {
-                    if self.focus == Focus::Channels {
-                        self.sidebar = self.conversations.len().saturating_sub(1);
-                    } else {
-                        self.selected = self.messages.len().saturating_sub(1);
-                    }
+                    self.move_selection(isize::MAX);
                 }
                 KeyCode::Char('R') => {
                     if self.conversations.is_empty() {
@@ -844,7 +1282,12 @@ impl App {
                     }
                 }
                 KeyCode::PageUp => {
-                    if !self.cursor.is_empty() {
+                    let cursor = if self.focus == Focus::Thread {
+                        self.thread_view.as_ref().map_or("", |v| v.cursor.as_str())
+                    } else {
+                        self.cursor.as_str()
+                    };
+                    if !cursor.is_empty() {
                         self.refresh(true);
                     } else {
                         self.move_selection(-5);

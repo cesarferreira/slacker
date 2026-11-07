@@ -9,16 +9,16 @@ fn demo_has_real_offline_media_and_reactions() {
     assert!(
         app.messages
             .iter()
-            .filter(|m| m.files.iter().any(|f| f.mimetype.starts_with("image/")))
-            .count()
-            >= 2
+            .any(|m| m.files.iter().any(|f| f.mimetype.starts_with("image/")))
     );
+    assert!(app.messages.iter().any(|m| !m.reactions.is_empty()));
+    app.open_channel(1);
     assert!(
         app.messages
             .iter()
             .any(|m| m.files.iter().any(|f| f.is_video()))
     );
-    assert!(app.messages.iter().any(|m| !m.reactions.is_empty()));
+    app.open_channel(3);
     app.selected = app
         .messages
         .iter()
@@ -33,9 +33,10 @@ fn demo_thread_opens_the_actual_selected_parent_and_has_replies() {
     app.selected = app.messages.iter().position(|m| m.reply_count > 0).unwrap();
     let parent = app.messages[app.selected].clone();
     app.open_thread();
-    assert_eq!(app.messages[0].ts, parent.ts);
-    assert_eq!(app.messages[0].text, parent.text);
-    assert!(app.messages.len() >= 3);
+    let view = app.thread_view.as_ref().unwrap();
+    assert_eq!(view.messages[0].ts, parent.ts);
+    assert_eq!(view.messages[0].text, parent.text);
+    assert!(view.messages.len() >= 3);
 }
 #[test]
 fn composer_is_a_single_obvious_field_with_send_only_when_needed() {
@@ -104,19 +105,26 @@ fn inline_images_reactions_and_reply_links_are_clickable() {
     let parent = app.messages[index].ts.clone();
     click(&mut app, &mut ui, rect);
     assert_eq!(app.thread.as_deref(), Some(parent.as_str()));
-    assert_eq!(app.messages.len(), 3);
+    assert_eq!(app.thread_view.as_ref().unwrap().messages.len(), 3);
 }
 
 #[test]
 fn demo_replies_survive_closing_and_reopening_the_thread() {
     let mut app = App::demo(false);
     app.open_thread();
-    app.editor.insert("A real local reply");
+    app.active_editor_mut().insert("A real local reply");
     app.send();
     app.close_thread();
     assert_eq!(app.messages[app.selected].reply_count, 3);
     app.open_thread();
-    assert!(app.messages.iter().any(|m| m.text == "A real local reply"));
+    assert!(
+        app.thread_view
+            .as_ref()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.text == "A real local reply")
+    );
 }
 
 #[test]
@@ -127,7 +135,10 @@ fn parent_reactions_stay_in_sync_after_a_thread_has_been_cached() {
     app.toggle_demo_reaction(app.selected, 0);
     let count = app.messages[app.selected].reactions[0].count;
     app.open_thread();
-    assert_eq!(app.messages[0].reactions[0].count, count);
+    assert_eq!(
+        app.thread_view.as_ref().unwrap().messages[0].reactions[0].count,
+        count
+    );
     app.close_thread();
     assert_eq!(app.messages[app.selected].reactions[0].count, count);
 }

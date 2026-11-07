@@ -255,7 +255,10 @@ fn run(
         }
         if refresh > 0 && last_refresh.elapsed() >= Duration::from_secs(refresh.max(60)) {
             if !standalone && !app.loading && !app.sending {
-                app.refresh(false);
+                app.refresh_channel(false);
+                if app.thread_view.is_some() {
+                    app.refresh_thread(false);
+                }
             }
             last_refresh = Instant::now();
         }
@@ -302,8 +305,16 @@ fn run(
             out.flush()?;
             last_inline = ui.inline_images.clone();
         }
+        app.refresh_presence(&ui.visible_people);
+        app.refresh_unreads();
         if app.mode == Mode::Read {
-            app.read_scroll = app.read_scroll.min(ui.read_scroll_max);
+            if app.focus == slacker::app::Focus::Thread
+                && let Some(view) = &mut app.thread_view
+            {
+                view.read_scroll = view.read_scroll.min(ui.read_scroll_max);
+            } else {
+                app.read_scroll = app.read_scroll.min(ui.read_scroll_max);
+            }
         }
         if let Some(viewer) = &mut app.viewer
             && viewer.dirty
@@ -336,7 +347,7 @@ fn run(
                 Event::FocusLost => app.notifications.focus(false),
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     app.notifications.focus(true);
-                    app.key(key);
+                    ui::key(app, &mut ui, key);
                 }
                 Event::Mouse(mouse) => {
                     if !matches!(
@@ -348,9 +359,9 @@ fn run(
                     ui::mouse(app, &mut ui, mouse);
                 }
                 Event::Paste(text) => match app.mode {
-                    Mode::Compose if !app.sending => {
-                        app.editor.insert(&slacker::app::safe_text(&text))
-                    }
+                    Mode::Compose if !app.active_sending() => app
+                        .active_editor_mut()
+                        .insert(&slacker::app::safe_text(&text)),
                     Mode::Switcher => app
                         .query
                         .insert(&slacker::app::safe_text(&text).replace('\n', " ")),
