@@ -5,16 +5,16 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const BG: Color = Color::Rgb(19, 22, 32);
-const PANEL: Color = Color::Rgb(25, 29, 42);
-const FG: Color = Color::Rgb(220, 226, 240);
-const MUTED: Color = Color::Rgb(132, 145, 168);
-const ACCENT: Color = Color::Rgb(184, 162, 255);
-const SELECTED: Color = Color::Rgb(45, 44, 67);
+const BG: Color = Color::Rgb(25, 17, 30);
+const PANEL: Color = Color::Rgb(35, 19, 41);
+const FG: Color = Color::Rgb(250, 246, 252);
+const MUTED: Color = Color::Rgb(183, 165, 191);
+const ACCENT: Color = Color::Rgb(215, 185, 230);
+const SELECTED: Color = Color::Rgb(69, 43, 77);
 const GREEN: Color = Color::Rgb(133, 218, 177);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,11 +54,12 @@ pub struct UiState {
 fn border(title: impl Into<Line<'static>>, active: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(title)
         .border_style(Style::default().fg(if active {
             ACCENT
         } else {
-            Color::Rgb(55, 63, 82)
+            Color::Rgb(66, 45, 74)
         }))
 }
 
@@ -67,7 +68,7 @@ fn button(frame: &mut Frame, ui: &mut UiState, area: Rect, label: &str, action: 
         return;
     }
     frame.render_widget(
-        Paragraph::new(label).style(Style::default().fg(ACCENT).bg(SELECTED)),
+        Paragraph::new(label).style(Style::default().fg(MUTED)),
         area,
     );
     ui.hits.push(Hit { action, rect: area });
@@ -86,6 +87,27 @@ fn toolbar(frame: &mut Frame, ui: &mut UiState, area: Rect, buttons: &[(&str, Ac
         );
         x = x.saturating_add(width + 1);
     }
+}
+
+fn ellipsize(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let size = character.width().unwrap_or(0);
+        if used + size > width - 1 {
+            break;
+        }
+        result.push(character);
+        used += size;
+    }
+    result.push('…');
+    result
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -245,7 +267,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " ◆ slacker  ",
+                "  slacker  ",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(safe_text(&app.workspace), Style::default().fg(MUTED)),
@@ -258,42 +280,88 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         header[1],
         &[("Ctrl+K Jump", Action::Switch), ("? Help", Action::Help)],
     );
-    let sidebar_width = if area.width >= 85 { 25 } else { 19 };
+    let sidebar_width = if area.width >= 85 {
+        (area.width / 3).clamp(28, 42)
+    } else if area.width >= 60 {
+        23
+    } else {
+        17
+    };
     let cols =
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(15)]).split(rows[1]);
     ui.sidebar_area = cols[0];
-    let sidebar = border(" Conversations ", app.focus == Focus::Channels);
+    let sidebar = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(if app.focus == Focus::Channels {
+            Color::Rgb(103, 72, 117)
+        } else {
+            Color::Rgb(57, 35, 65)
+        }))
+        .style(Style::default().bg(PANEL));
     let inner = sidebar.inner(cols[0]);
     frame.render_widget(sidebar, cols[0]);
-    let items: Vec<_> = app
-        .conversations
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            ListItem::new(safe_text(&format!(
-                " {}{}",
-                if i == app.channel { "● " } else { "  " },
-                c.label()
-            )))
-            .style(Style::default().fg(if i == app.channel { GREEN } else { MUTED }))
-        })
-        .collect();
-    ui.channels.select(Some(app.sidebar));
+    let mut items = Vec::new();
+    let mut channel_rows = Vec::new();
+    items.push(ListItem::new(""));
+    channel_rows.push(None);
+    for (is_dm, heading) in [(false, "#  Channels"), (true, "◉  Direct messages")] {
+        if !app.conversations.iter().any(|c| c.is_im == is_dm) {
+            continue;
+        }
+        if is_dm {
+            items.push(ListItem::new(""));
+            channel_rows.push(None);
+        }
+        items.push(ListItem::new(format!("  {heading}")).style(Style::default().fg(MUTED)));
+        channel_rows.push(None);
+        for (index, conversation) in app
+            .conversations
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_im == is_dm)
+        {
+            let icon = if conversation.is_im {
+                "•"
+            } else if conversation.is_private {
+                "🔒"
+            } else {
+                "#"
+            };
+            let label = format!("    {icon}  {}", safe_text(&conversation.name));
+            let active = index == app.channel;
+            items.push(
+                ListItem::new(ellipsize(&label, inner.width as usize)).style(
+                    Style::default()
+                        .fg(if active { FG } else { MUTED })
+                        .add_modifier(if active {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            );
+            channel_rows.push(Some(index));
+        }
+    }
+    ui.channels
+        .select(channel_rows.iter().position(|i| *i == Some(app.sidebar)));
     frame.render_stateful_widget(
-        List::new(items)
-            .style(Style::default().bg(PANEL))
-            .highlight_style(Style::default().bg(SELECTED).fg(FG)),
+        List::new(items).highlight_style(Style::default().bg(SELECTED).fg(FG)),
         inner,
         &mut ui.channels,
     );
-    for (row, index) in (ui.channels.offset()..app.conversations.len())
+    for (row, index) in channel_rows
+        .iter()
+        .skip(ui.channels.offset())
         .take(inner.height as usize)
         .enumerate()
     {
-        ui.hits.push(Hit {
-            rect: Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
-            action: Action::Channel(index),
-        });
+        if let Some(index) = index {
+            ui.hits.push(Hit {
+                rect: Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+                action: Action::Channel(*index),
+            });
+        }
     }
     let main = Layout::vertical([
         Constraint::Length(3),
@@ -312,7 +380,17 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     } else {
         format!(" {title} ")
     };
-    frame.render_widget(border(safe_text(&title), false), main[0]);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::Rgb(66, 45, 74))),
+        main[0],
+    );
+    frame.render_widget(
+        Paragraph::new(safe_text(&title))
+            .style(Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+        Rect::new(main[0].x + 1, main[0].y, main[0].width.saturating_sub(2), 1),
+    );
     let title_inner = main[0].inner(ratatui::layout::Margin {
         horizontal: 1,
         vertical: 1,
@@ -419,7 +497,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     });
     frame.render_stateful_widget(
         List::new(items)
-            .highlight_style(Style::default().bg(SELECTED))
+            .highlight_style(Style::default().bg(Color::Rgb(37, 25, 43)))
             .style(Style::default().fg(FG)),
         main[1],
         &mut ui.messages,

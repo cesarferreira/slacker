@@ -266,3 +266,39 @@ fn sent_reply_stays_visible_while_intermediate_thread_pages_are_loading() {
     assert!(app.messages.iter().any(|m| m.text == "sent reply"));
     assert_eq!(app.thread_latest.as_deref(), Some("1731000100.000001"));
 }
+
+#[test]
+fn grouped_sidebar_keeps_direct_messages_clickable_and_scrolls_to_selection() {
+    let mut app = App::demo(false);
+    let dm_index = app.conversations.len() - 1;
+    app.sidebar = dm_index;
+    let mut ui = UiState::default();
+    let mut terminal = Terminal::new(TestBackend::new(100, 22)).unwrap();
+    terminal.draw(|f| ui::draw(f, &app, &mut ui)).unwrap();
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(screen.contains("Direct messages"));
+    assert!(screen.contains("Channels"));
+    let rect = ui
+        .hits
+        .iter()
+        .find(|h| h.action == Action::Channel(dm_index))
+        .unwrap()
+        .rect;
+    ui::mouse(
+        &mut app,
+        &mut ui,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(app.channel, dm_index);
+}
