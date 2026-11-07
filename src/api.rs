@@ -126,11 +126,31 @@ pub fn decode_messages(value: Value) -> Result<Vec<Message>> {
     Ok(messages)
 }
 
+pub fn session_api_url(value: &str) -> Result<String> {
+    let mut url =
+        reqwest::Url::parse(value).context("Slack returned an invalid workspace endpoint")?;
+    if url.scheme() != "https"
+        || !url
+            .host_str()
+            .is_some_and(|host| host == "slack.com" || host.ends_with(".slack.com"))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some_and(|port| port != 443)
+    {
+        bail!("Slack returned an untrusted workspace endpoint");
+    }
+    url.set_path("/api/");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
 #[derive(Clone)]
 pub struct Slack {
     client: Client,
     token: String,
     base_url: String,
+    session: bool,
 }
 
 impl Slack {
@@ -147,18 +167,75 @@ impl Slack {
                 .build()?,
             token,
             base_url,
+            session: false,
         })
     }
 
+    pub fn with_session(token: String, cookie: String, domain: &str) -> Result<Self> {
+        if domain.is_empty()
+            || !domain
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            bail!("Invalid Slack workspace domain");
+        }
+        Self::with_session_base_url(token, cookie, format!("https://{domain}.slack.com/api/"))
+    }
+
+    pub fn with_session_base_url(token: String, cookie: String, base_url: String) -> Result<Self> {
+        let url = reqwest::Url::parse(&base_url)?;
+        if cookie.is_empty() || cookie.bytes().any(|b| b <= 0x20 || b >= 0x7f || b == b';') {
+            bail!("Invalid Slack desktop session cookie");
+        }
+        let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+        let scope = if url
+            .host_str()
+            .is_some_and(|host| host == "slack.com" || host.ends_with(".slack.com"))
+        {
+            "; Domain=.slack.com; Secure"
+        } else {
+            ""
+        };
+        jar.add_cookie_str(&format!("d={cookie}; Path=/{scope}; HttpOnly"), &url);
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .user_agent("slacker/0.1")
+            .cookie_provider(jar)
+            .build()?;
+        Ok(Self {
+            client,
+            token,
+            base_url,
+            session: true,
+        })
+    }
+
+    pub fn validate(&mut self) -> Result<()> {
+        let identity = self.request("auth.test", &[])?;
+        if self.session
+            && let Some(url) = identity["url"].as_str()
+        {
+            self.base_url = session_api_url(url)?;
+        }
+        Ok(())
+    }
+
     fn request(&self, method: &str, params: &[(&str, &str)]) -> Result<Value> {
-        let response = self
-            .client
-            .get(format!("{}{method}", self.base_url))
-            .bearer_auth(&self.token)
-            .query(params)
-            .send()
-            .context("Could not reach Slack")?;
-        Self::response(response)
+        let request = if self.session {
+            let mut form = params.to_vec();
+            form.push(("token", &self.token));
+            self.client
+                .post(format!("{}{method}", self.base_url))
+                .form(&form)
+        } else {
+            self.client
+                .get(format!("{}{method}", self.base_url))
+                .bearer_auth(&self.token)
+                .query(params)
+        };
+        let response = request.send().context("Could not reach Slack")?;
+        Self::response(response).with_context(|| format!("Slack {method} request failed"))
     }
 
     fn response(response: reqwest::blocking::Response) -> Result<Value> {
@@ -221,16 +298,45 @@ impl Slack {
             users.insert(id.to_owned(), name.to_owned());
         }
         let mut conversations = Vec::new();
-        for value in self.pages(
-            "conversations.list",
-            "channels",
-            &[
-                ("types", "public_channel,private_channel,im,mpim"),
-                ("exclude_archived", "true"),
-                ("limit", "200"),
-            ],
-        )? {
+        let entries = if self.session {
+            let boot = self.request(
+                "client.userBoot",
+                &[
+                    ("version_all_channels", "false"),
+                    ("return_all_relevant_mpdms", "true"),
+                    (
+                        "omit_extras",
+                        "feature_usage_data,plan_info,salesforce_features",
+                    ),
+                ],
+            )?;
+            let mut entries = boot["channels"]
+                .as_array()
+                .context("Slack desktop boot returned no channels")?
+                .clone();
+            if let Some(ims) = boot["ims"].as_array() {
+                entries.extend(ims.iter().cloned());
+            }
+            entries
+        } else {
+            self.pages(
+                "conversations.list",
+                "channels",
+                &[
+                    ("types", "public_channel,private_channel,im,mpim"),
+                    ("exclude_archived", "true"),
+                    ("limit", "200"),
+                ],
+            )?
+        };
+        for value in entries {
+            if value["is_archived"].as_bool() == Some(true) {
+                continue;
+            }
             let mut c: Conversation = serde_json::from_value(value)?;
+            if self.session {
+                c.is_member = true;
+            }
             if !c.is_im && !c.is_member {
                 continue;
             }
@@ -288,10 +394,16 @@ impl Slack {
         if let Some(ts) = thread {
             body["thread_ts"] = json!(ts);
         }
-        let response = self
+        let request = self
             .client
-            .post(format!("{}chat.postMessage", self.base_url))
-            .bearer_auth(&self.token)
+            .post(format!("{}chat.postMessage", self.base_url));
+        let request = if self.session {
+            body["token"] = json!(self.token);
+            request
+        } else {
+            request.bearer_auth(&self.token)
+        };
+        let response = request
             .json(&body)
             .send()
             .context("Could not send message; check Slack before retrying")?;

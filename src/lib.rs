@@ -5,3 +5,5 @@ pub mod ui;
 
 pub mod demo;
 pub mod notifications;
+
+pub mod auth;

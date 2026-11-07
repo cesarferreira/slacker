@@ -165,3 +165,54 @@ fn thread_incremental_fetch_uses_the_last_loaded_timestamp() {
     assert!(request.contains("oldest=1731000060.000001"));
     assert!(request.contains("ts=1731000000.000001"));
 }
+
+#[test]
+fn desktop_session_uses_cookie_and_form_auth_without_secrets_in_the_url() {
+    let (url, server) = server(vec![("200 OK", json!({"ok":true}))]);
+    Slack::with_session_base_url("xoxc-unit-test".into(), "xoxd-unit-test".into(), url)
+        .unwrap()
+        .validate()
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(requests[0].starts_with("POST /auth.test HTTP/1.1"));
+    assert!(
+        requests[0]
+            .to_lowercase()
+            .contains("cookie: d=xoxd-unit-test")
+    );
+    let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
+    assert!(!headers.contains("xoxc-unit-test"));
+    assert_eq!(body, "token=xoxc-unit-test");
+}
+
+#[test]
+fn enterprise_session_routes_to_the_trusted_workspace_api_host() {
+    use slacker::api::session_api_url;
+    assert_eq!(
+        session_api_url("https://acme.enterprise.slack.com/").unwrap(),
+        "https://acme.enterprise.slack.com/api/"
+    );
+    assert!(session_api_url("https://slack.com.attacker.test/").is_err());
+    assert!(session_api_url("http://acme.slack.com/").is_err());
+    assert!(session_api_url("https://user:password@acme.slack.com/").is_err());
+}
+
+#[test]
+fn desktop_bootstrap_lists_joined_conversations_without_enterprise_restricted_enumeration() {
+    let (url, server) = server(vec![
+        ("200 OK", json!({"ok":true,"team":"Acme","user_id":"U1"})),
+        ("200 OK", json!({"ok":true,"members":[]})),
+        (
+            "200 OK",
+            json!({"ok":true,"channels":[{"id":"C1","name":"engineering"}]}),
+        ),
+    ]);
+    let snapshot =
+        Slack::with_session_base_url("xoxc-unit-test".into(), "xoxd-unit-test".into(), url)
+            .unwrap()
+            .bootstrap()
+            .unwrap();
+    assert_eq!(snapshot.conversations.len(), 1);
+    let requests = server.join().unwrap();
+    assert!(requests[2].starts_with("POST /client.userBoot "));
+}

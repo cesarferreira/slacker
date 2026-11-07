@@ -5,7 +5,7 @@
 
   <p>
     <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
-    <img alt="Rust" src="https://img.shields.io/badge/rust-1.88%2B-orange">
+    <img alt="Rust" src="https://img.shields.io/badge/rust-1.89%2B-orange">
     <img alt="Edition" src="https://img.shields.io/badge/edition-2024-blue">
     <a href="https://crates.io/crates/slacker"><img alt="crates.io" src="https://img.shields.io/crates/v/slacker.svg"></a>
   </p>
@@ -23,7 +23,7 @@
 
 ## Install
 
-Requires [Rust](https://rustup.rs) **1.88+** and `~/.cargo/bin` on your `PATH`.
+Requires [Rust](https://rustup.rs) **1.89+** and `~/.cargo/bin` on your `PATH`.
 
 ```bash
 cargo install --path . --locked
@@ -89,9 +89,45 @@ needed for the demo.
 
 ### Connect to Slack
 
-Create a Slack app, add **User Token Scopes**, install it to your workspace,
-and set its user OAuth token in `SLACK_TOKEN`. Start a new token with these
-scopes (your workspace may require administrator approval):
+Sign in to the Slack desktop app, then run:
+
+```bash
+slacker
+```
+
+On first launch, choose one of your signed-in workspaces. There is no Slack app
+to register and no token to copy. On macOS, allow the **Slack Safe Storage**
+Keychain prompt if it appears. The selected workspace is remembered; credentials
+are read fresh from the desktop session on each launch. Slacker stores only the
+workspace choice, never a duplicate token or cookie file.
+
+```bash
+slacker auth                    # choose or reconnect a workspace
+slacker --workspace example      # choose by name, domain, or workspace ID
+slacker --channel engineering
+slacker --bell                   # optional sound for background messages
+slacker --refresh 0              # disable automatic refresh
+```
+
+This follows [slk's desktop-session setup](https://github.com/gammons/slk/wiki/Setup).
+Desktop sign-in supports macOS Keychain and Linux Secret Service (`secret-tool`),
+including native, Flatpak, and Snap profile locations. Windows desktop cookie
+decryption and KDE KWallet are not implemented yet. If Slack signs you out,
+sign back in to the desktop app and run `slacker auth` again.
+
+Only joined channels and existing DMs are listed. Messages load in pages of 15;
+`PgUp` requests another page. Threads load from oldest replies forward, and
+refresh adds replies while preserving loaded messages. Failed sends keep the
+draft. Drafts are separate for each conversation and thread during the session.
+`R` refreshes manually. Automatic refresh runs every 60 seconds; nonzero intervals
+below 60 seconds are clamped to 60. Slack rate limits show the server's retry
+delay, and sending is never retried automatically.
+
+<details>
+<summary>Advanced: use an existing OAuth token instead</summary>
+
+`SLACK_TOKEN` remains an optional override for servers or setups without desktop
+session access. Use a Slack user OAuth token with the relevant scopes:
 
 ```text
 channels:read   groups:read   im:read   mpim:read   users:read
@@ -99,27 +135,10 @@ channels:history   groups:history   im:history   mpim:history
 chat:write   files:read
 ```
 
-See Slack's [OAuth guide](https://docs.slack.dev/authentication/installing-with-oauth/)
-and [conversation history reference](https://docs.slack.dev/reference/methods/conversations.history/).
-A user token is recommended because channel-thread access differs for bot
-tokens. Tokens are read from the environment, never saved by slacker.
+See Slack's [OAuth guide](https://docs.slack.dev/authentication/installing-with-oauth/).
+The override is read from the environment and never saved.
 
-```bash
-# Set SLACK_TOKEN in your environment, then:
-slacker
-slacker --channel engineering
-slacker --bell
-slacker --refresh 0
-```
-
-Only joined channels and existing DMs are listed. Messages load in pages of
-15; `PgUp` requests another page. Threads load from the oldest replies forward,
-and refresh adds replies after the last loaded timestamp while preserving loaded
-messages. Successful sends appear immediately. `R` refreshes manually. Automatic refresh runs every 60 seconds by default. Set `--refresh 0` to disable
-it; nonzero intervals below 60 seconds are clamped to 60. Slack
-rate-limit responses show the server's retry delay. Sending is never retried
-automatically, and failed sends retain the draft. Drafts are kept separately
-per conversation and thread for the current session.
+</details>
 
 ### Unread title and sound
 

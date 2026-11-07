@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::{MoveTo, RestorePosition, SavePosition},
@@ -25,7 +25,7 @@ use std::{
 #[command(
     version,
     about = "Slack in your terminal, with Kitty images and video",
-    after_help = "Run `slacker --demo` to explore without a Slack account.\nAuthentication: set SLACK_TOKEN to a Slack user OAuth token.\nPress ? in the app for keyboard and mouse controls."
+    after_help = "Run `slacker --demo` to explore without a Slack account.\nRun slacker to connect using Slack desktop, or slacker auth to choose a workspace.\nPress ? in the app for keyboard and mouse controls."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,6 +42,9 @@ struct Cli {
     /// Ring the terminal bell for new messages received while unfocused
     #[arg(long)]
     bell: bool,
+    /// Choose a signed-in workspace by name, domain or ID
+    #[arg(long, global = true)]
+    workspace: Option<String>,
     /// Start in a conversation by name or ID
     #[arg(long)]
     channel: Option<String>,
@@ -63,6 +66,8 @@ enum Command {
     },
     /// Print terminal, authentication and FFmpeg availability
     Doctor,
+    /// Connect using a signed-in Slack desktop account
+    Auth,
 }
 
 fn main() -> Result<()> {
@@ -85,12 +90,16 @@ fn main() -> Result<()> {
             }
         );
         println!(
-            "Slack token: {}",
+            "SLACK_TOKEN override: {}",
             if token().is_some() {
                 "set"
             } else {
-                "missing (set SLACK_TOKEN)"
+                "not set (optional)"
             }
+        );
+        println!(
+            "Slack desktop: {} signed-in workspace(s)",
+            slacker::auth::discover().len()
         );
         let ffmpeg = std::process::Command::new("ffmpeg")
             .arg("-version")
@@ -112,6 +121,11 @@ fn main() -> Result<()> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         bail!("The TUI needs an interactive terminal. Try slacker --help or slacker doctor.");
     }
+    if matches!(cli.command, Some(Command::Auth)) {
+        slacker::auth::connect(cli.workspace.as_deref(), true)?;
+        println!("Run slacker to start chatting.");
+        return Ok(());
+    }
     let mut app = if let Some(Command::Media { path, video }) = cli.command {
         if !graphics {
             bail!(
@@ -126,8 +140,12 @@ fn main() -> Result<()> {
     } else if cli.demo {
         App::demo(graphics)
     } else {
-        let token = token().context("Set SLACK_TOKEN to a Slack user OAuth token, or run slacker --demo. See README for required scopes.")?;
-        let worker = Worker::new(Slack::new(token)?);
+        let slack = if let Some(token) = token() {
+            Slack::new(token)?
+        } else {
+            slacker::auth::connect(cli.workspace.as_deref(), false)?
+        };
+        let worker = Worker::new(slack);
         worker.jobs.send(Job::Bootstrap)?;
         App::new(Some(worker), graphics)
     };

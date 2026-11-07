@@ -2,7 +2,7 @@
 name = "slacker"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Chat on Slack with native terminal media"
 license = "MIT"
 authors = ["Cesar Ferreira"]
@@ -17,7 +17,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache", "underline-color"] }
-reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "query", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "query", "form", "cookies", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.23.1"
@@ -25,6 +25,14 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 tempfile = "3"
 textwrap = "0.16"
 unicode-width = "0.2"
+aes = "0.9.4"
+cbc = { version = "0.2.1", features = ["alloc"] }
+pbkdf2 = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
+rusty-leveldb = "4.0.2"
+dirs = "7"
 
 [profile.release]
 lto = "thin"
