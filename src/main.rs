@@ -288,7 +288,12 @@ fn run(
                 media::clear_id(&mut out, image.id)?;
             }
             for image in &ui.inline_images {
-                if let Some(pixels) = app.demo_images.get(&image.name) {
+                let pixels = image
+                    .name
+                    .strip_prefix("avatar:")
+                    .and_then(|user| app.avatars.get(user))
+                    .or_else(|| app.demo_images.get(&image.name));
+                if let Some(pixels) = pixels {
                     execute!(out, SavePosition, MoveTo(image.rect.x, image.rect.y))?;
                     media::transmit_id(
                         &mut out,
@@ -306,6 +311,7 @@ fn run(
             last_inline = ui.inline_images.clone();
         }
         app.refresh_presence(&ui.visible_people);
+        app.refresh_avatars(&ui.visible_avatars);
         app.refresh_unreads();
         if app.mode == Mode::Read {
             if app.focus == slacker::app::Focus::Thread

@@ -102,6 +102,7 @@ pub enum Presence {
 
 #[derive(Clone, Debug, Default)]
 pub struct Person {
+    pub avatar_url: String,
     pub display_name: String,
     pub status_emoji: String,
     pub status_text: String,
@@ -320,6 +321,11 @@ impl Slack {
             people.insert(
                 id.to_owned(),
                 Person {
+                    avatar_url: ["image_48", "image_72", "image_192", "image_32", "image_24"]
+                        .iter()
+                        .find_map(|key| user["profile"][key].as_str().filter(|s| !s.is_empty()))
+                        .unwrap_or("")
+                        .to_owned(),
                     display_name: name.to_owned(),
                     status_emoji: user["profile"]["status_emoji"]
                         .as_str()

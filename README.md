@@ -158,6 +158,13 @@ clear the count when you press a key or click.
 
 ### Panes and people
 
+Conversations show profile photos beside aligned message blocks, local-time
+timestamps, and date separators. Times and dates follow your computer's timezone,
+including daylight saving. Profile photos load in the background and are reused
+throughout the session. Kitty-compatible terminals show native images;
+`--graphics off` uses small pixelated photos. Initials appear while a photo is
+loading or unavailable.
+
 Drag the divider beside the sidebar to resize it. Clicking a replies link opens
 an independent thread panel on the right; drag its divider to adjust its width.
 Channel and thread drafts stay separate, and sending keeps the composer focused.

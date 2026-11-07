@@ -100,6 +100,35 @@ pub struct Pixels {
     pub height: u32,
 }
 
+pub fn fetch_avatar(url: &str) -> Result<Pixels> {
+    // Profile images live on public CDNs; never send Slack credentials to them.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(3))
+        .build()?;
+    let response = client.get(url).send()?.error_for_status()?;
+    let mut bytes = Vec::new();
+    response.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 256 * 1024 {
+        bail!("Profile photo is too large");
+    }
+    let mut reader = image::ImageReader::new(io::Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(16 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
+        .decode()?
+        .resize_exact(48, 48, image::imageops::FilterType::Triangle)
+        .to_rgb8();
+    Ok(Pixels {
+        width: 48,
+        height: 48,
+        rgb: image.into_raw(),
+    })
+}
+
 impl Pixels {
     pub fn open(path: &Path) -> Result<Self> {
         let reader = image::ImageReader::open(path)?.with_guessed_format()?;

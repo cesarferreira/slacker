@@ -19,6 +19,10 @@ const MUTED: Color = Color::Rgb(183, 165, 191);
 const ACCENT: Color = Color::Rgb(215, 185, 230);
 const SELECTED: Color = Color::Rgb(69, 43, 77);
 const GREEN: Color = Color::Rgb(133, 218, 177);
+const CHAT_BG: Color = Color::Rgb(43, 51, 65);
+const CHAT_FG: Color = Color::Rgb(200, 211, 239);
+const CHAT_MUTED: Color = Color::Rgb(165, 175, 201);
+const CHAT_CHIP: Color = Color::Rgb(57, 67, 85);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -74,6 +78,7 @@ pub struct UiState {
     pub sidebar_divider: Rect,
     pub thread_divider: Rect,
     pub visible_people: Vec<String>,
+    pub visible_avatars: Vec<String>,
     bounds: Rect,
     dragging: Option<Divider>,
     manual_sidebar_scroll: bool,
@@ -474,6 +479,22 @@ fn thread_action(action: Action) -> Action {
     }
 }
 
+fn message_time(ts: &str) -> Option<chrono::DateTime<chrono::Local>> {
+    chrono::DateTime::from_timestamp(ts.split('.').next()?.parse().ok()?, 0)
+        .map(|time| time.with_timezone(&chrono::Local))
+}
+
+fn date_label(date: chrono::NaiveDate) -> String {
+    let today = chrono::Local::now().date_naive();
+    if date == today {
+        "Today".into()
+    } else if Some(date) == today.pred_opt() {
+        "Yesterday".into()
+    } else {
+        date.format("%A, %B %-d, %Y").to_string()
+    }
+}
+
 fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread: bool) {
     let hit_start = ui.hits.len();
     let (messages, selected, editor, loading, sending) = if thread {
@@ -570,12 +591,15 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
     } else {
         ui.message_area = main[1];
     }
-    let width = main[1].width.saturating_sub(4).max(1) as usize;
+    let gutter = if main[1].width >= 24 { 7 } else { 1 };
+    let width = main[1].width.saturating_sub(gutter + 2).max(1) as usize;
     let mut heights = Vec::new();
     let mut attachment_rows = Vec::new();
     let mut preview_rows = Vec::new();
     let mut reaction_rows = Vec::new();
     let mut reply_rows = Vec::new();
+    let mut date_rows = Vec::new();
+    let mut previous_date = None;
     let items: Vec<_> = messages
         .iter()
         .map(|m| {
@@ -591,25 +615,29 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
             } else {
                 author
             };
-            let time =
-                m.ts.split('.')
-                    .next()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .map(|n| format!("{:02}:{:02} UTC", (n / 3600) % 24, (n / 60) % 60))
-                    .unwrap_or_default();
+            let local = message_time(&m.ts);
+            let date = local.map(|time| time.date_naive());
+            let separator = date.filter(|date| Some(*date) != previous_date);
+            previous_date = date;
+            let time = local
+                .map(|time| time.format("%-I:%M %p").to_string())
+                .unwrap_or_default();
             let mut lines = vec![Line::from(vec![
                 Span::styled(
-                    format!(" {} ", safe_text(&author)),
-                    Style::default()
-                        .fg(if m.user == app.me { GREEN } else { ACCENT })
-                        .add_modifier(Modifier::BOLD),
+                    format!("{}  ", safe_text(&author)),
+                    Style::default().fg(CHAT_MUTED).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(time, Style::default().fg(MUTED)),
+                Span::styled(
+                    time,
+                    Style::default()
+                        .fg(CHAT_MUTED)
+                        .add_modifier(Modifier::ITALIC),
+                ),
             ])];
             let text = display_text(app, &m.text);
             for paragraph in text.split('\n') {
                 for line in textwrap::wrap(paragraph, width) {
-                    lines.push(Line::from(format!(" {line}")));
+                    lines.push(Line::from(line.into_owned()));
                 }
             }
             let mut file_rows = Vec::new();
@@ -620,7 +648,7 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
                 }
                 lines.push(Line::from(Span::styled(
                     format!(
-                        " {} {}",
+                        "{} {}",
                         if file.is_video() {
                             "▶"
                         } else if file.is_media() {
@@ -630,7 +658,9 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
                         },
                         safe_text(&file.name)
                     ),
-                    Style::default().fg(GREEN),
+                    Style::default()
+                        .fg(CHAT_MUTED)
+                        .add_modifier(Modifier::UNDERLINED),
                 )));
                 if app.graphics
                     && main[1].height >= 10
@@ -652,11 +682,28 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
                     }
                 }
             }
+            let reply_row = (m.reply_count > 0).then_some(lines.len() as u16);
+            if m.reply_count > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "[{} {} →]",
+                        m.reply_count,
+                        if m.reply_count == 1 {
+                            "reply"
+                        } else {
+                            "replies"
+                        }
+                    ),
+                    Style::default()
+                        .fg(CHAT_MUTED)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            }
             let mut reactions = Vec::new();
             if !m.reactions.is_empty() {
                 let row = lines.len() as u16;
-                let mut spans = vec![Span::raw(" ")];
-                let mut x = 1u16;
+                let mut spans = vec![];
+                let mut x = 0u16;
                 for (index, reaction) in m.reactions.iter().enumerate() {
                     let label = format!(
                         " {} {} ",
@@ -665,35 +712,64 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
                     );
                     let length = label.width() as u16;
                     reactions.push((index, row, x, length));
-                    spans.push(Span::styled(label, Style::default().fg(FG).bg(SELECTED)));
+                    spans.push(Span::styled(
+                        label,
+                        Style::default().fg(CHAT_MUTED).bg(CHAT_CHIP),
+                    ));
                     spans.push(Span::raw(" "));
                     x = x.saturating_add(length + 1);
                 }
                 lines.push(Line::from(spans));
             }
-            let reply_row = (m.reply_count > 0).then_some(lines.len() as u16);
-            if m.reply_count > 0 {
-                lines.push(Line::from(Span::styled(
-                    format!(" ↳ {} replies", m.reply_count),
-                    Style::default().fg(ACCENT),
-                )));
-            }
             lines.push(Line::from(""));
+            for line in &mut lines {
+                line.spans.insert(0, Span::raw(" ".repeat(gutter as usize)));
+            }
+            let date_height = u16::from(separator.is_some());
+            if let Some(date) = separator {
+                lines.insert(
+                    0,
+                    Line::from(Span::styled(
+                        format!("─  {}  ─", date_label(date)),
+                        Style::default().fg(CHAT_MUTED).add_modifier(Modifier::BOLD),
+                    ))
+                    .centered(),
+                );
+            }
             // Keep a single long message navigable without forcing other rows offscreen.
             let max_lines = main[1].height.max(1) as usize;
             if lines.len() > max_lines {
                 lines.truncate(max_lines);
                 if let Some(last) = lines.last_mut() {
                     *last = Line::from(Span::styled(
-                        " … press o to read the full message",
-                        Style::default().fg(MUTED),
+                        format!(
+                            "{}… press o to read the full message",
+                            " ".repeat(gutter as usize)
+                        ),
+                        Style::default().fg(CHAT_MUTED),
                     ));
                 }
             }
-            attachment_rows.push(file_rows);
-            preview_rows.push(previews);
-            reaction_rows.push(reactions);
-            reply_rows.push(reply_row);
+            attachment_rows.push(
+                file_rows
+                    .into_iter()
+                    .map(|(i, r)| (i, r + date_height))
+                    .collect::<Vec<_>>(),
+            );
+            preview_rows.push(
+                previews
+                    .into_iter()
+                    .map(|(i, n, r, c, h)| (i, n, r + date_height, c, h))
+                    .collect::<Vec<_>>(),
+            );
+            reaction_rows.push(
+                reactions
+                    .into_iter()
+                    .map(|(i, r, x, w)| (i, r + date_height, x + gutter, w))
+                    .collect::<Vec<_>>(),
+            );
+            reply_rows.push(reply_row.map(|r| r + date_height));
+            date_rows.push(date_height);
             heights.push(lines.len() as u16);
             ListItem::new(Text::from(lines))
         })
@@ -710,8 +786,8 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
     });
     frame.render_stateful_widget(
         List::new(items)
-            .highlight_style(Style::default().bg(Color::Rgb(37, 25, 43)))
-            .style(Style::default().fg(FG)),
+            .highlight_style(Style::default().bg(Color::Rgb(47, 57, 73)))
+            .style(Style::default().fg(CHAT_FG).bg(CHAT_BG)),
         main[1],
         state,
     );
@@ -735,6 +811,74 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
             rect: Rect::new(main[1].x, y, main[1].width, visible),
             action: Action::Message(index),
         });
+        if gutter > 1 && visible > date_rows[index] {
+            ui.visible_avatars.push(messages[index].user.clone());
+            let author = app
+                .users
+                .get(&messages[index].user)
+                .map(String::as_str)
+                .unwrap_or(&messages[index].username);
+            let initials: String = author
+                .split_whitespace()
+                .take(2)
+                .filter_map(|part| part.chars().next())
+                .flat_map(char::to_uppercase)
+                .collect();
+            let avatar = Rect::new(
+                main[1].x + 1,
+                y + date_rows[index],
+                4,
+                2.min(visible - date_rows[index]),
+            );
+            frame.render_widget(
+                Paragraph::new(format!(
+                    " {}",
+                    if initials.is_empty() { "?" } else { &initials }
+                ))
+                .style(
+                    Style::default()
+                        .fg(CHAT_MUTED)
+                        .bg(CHAT_CHIP)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                avatar,
+            );
+            if let Some(pixels) = app.avatars.get(&messages[index].user) {
+                if app.graphics
+                    && avatar.height == 2
+                    && ui.inline_images.len() < crate::media::INLINE_SLOTS as usize
+                {
+                    frame.render_widget(ratatui::widgets::Clear, avatar);
+                    ui.inline_images.push(InlineImage {
+                        name: format!("avatar:{}", messages[index].user),
+                        rect: avatar,
+                        id: crate::media::INLINE_BASE + ui.inline_images.len() as u32,
+                    });
+                } else {
+                    // Half-block pixels keep profile pictures available without Kitty graphics.
+                    let image =
+                        image::RgbImage::from_raw(pixels.width, pixels.height, pixels.rgb.clone());
+                    if let Some(image) = image {
+                        let image = image::imageops::resize(
+                            &image,
+                            4,
+                            4,
+                            image::imageops::FilterType::Triangle,
+                        );
+                        for row in 0..avatar.height {
+                            for col in 0..4 {
+                                let top = image.get_pixel(col, u32::from(row) * 2).0;
+                                let bottom = image.get_pixel(col, u32::from(row) * 2 + 1).0;
+                                frame.buffer_mut()[(avatar.x + col as u16, avatar.y + row)]
+                                    .set_symbol("▀")
+                                    .set_fg(Color::Rgb(top[0], top[1], top[2]))
+                                    .set_bg(Color::Rgb(bottom[0], bottom[1], bottom[2]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for (file_index, row) in &attachment_rows[index] {
             if *row < visible {
                 ui.hits.push(Hit {
@@ -746,7 +890,7 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
         for (file_index, name, row, columns, rows) in &preview_rows[index] {
             if row + rows <= visible && ui.inline_images.len() < crate::media::INLINE_SLOTS as usize
             {
-                let rect = Rect::new(main[1].x + 1, y + row, *columns, *rows);
+                let rect = Rect::new(main[1].x + gutter, y + row, *columns, *rows);
                 ui.inline_images.push(InlineImage {
                     name: name.clone(),
                     rect,
@@ -872,6 +1016,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     ui.thread_divider = Rect::default();
     ui.sidebar_divider = Rect::default();
     ui.visible_people.clear();
+    ui.visible_avatars.clear();
     ui.hits.clear();
     ui.inline_images.clear();
     ui.media_area = Rect::default();

@@ -5,7 +5,7 @@ use crate::{
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
@@ -106,6 +106,7 @@ pub enum Focus {
 }
 
 pub enum Job {
+    Avatars(Vec<(String, String)>),
     Bootstrap,
     Counts,
     Presence {
@@ -126,6 +127,7 @@ pub enum Job {
 }
 
 pub enum Reply {
+    Avatars(Vec<(String, crate::media::Pixels)>),
     Bootstrap(Result<Snapshot>),
     Counts(Result<HashMap<String, usize>>),
     Presence {
@@ -166,6 +168,21 @@ impl Worker {
         thread::spawn(move || {
             for job in rx {
                 let reply = match job {
+                    Job::Avatars(users) => {
+                        let tx = tx.clone();
+                        thread::spawn(move || {
+                            let photos = users
+                                .into_iter()
+                                .filter_map(|(user, url)| {
+                                    crate::media::fetch_avatar(&url)
+                                        .ok()
+                                        .map(|pixels| (user, pixels))
+                                })
+                                .collect();
+                            let _ = tx.send(Reply::Avatars(photos));
+                        });
+                        continue;
+                    }
                     Job::Counts => {
                         let client = client.clone();
                         let tx = tx.clone();
@@ -269,6 +286,9 @@ pub struct ThreadView {
 }
 
 pub struct App {
+    pub avatars: HashMap<String, crate::media::Pixels>,
+    avatar_requested: HashSet<String>,
+    avatar_loading: bool,
     pub notifications: crate::notifications::Notifications,
     pub demo_images: HashMap<String, crate::media::Pixels>,
     demo_saved: HashMap<(String, Option<String>), Vec<Message>>,
@@ -316,8 +336,40 @@ pub struct App {
 }
 
 impl App {
+    pub fn refresh_avatars(&mut self, visible: &[String]) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        if self.avatar_loading {
+            return;
+        }
+        let mut users = Vec::new();
+        for user in visible {
+            if self.avatars.contains_key(user) || self.avatar_requested.contains(user) {
+                continue;
+            }
+            let Some(person) = self.people.get(user) else {
+                continue;
+            };
+            if person.avatar_url.is_empty() {
+                continue;
+            }
+            self.avatar_requested.insert(user.clone());
+            users.push((user.clone(), person.avatar_url.clone()));
+            if users.len() >= 8 {
+                break;
+            }
+        }
+        if !users.is_empty() {
+            self.avatar_loading = worker.jobs.send(Job::Avatars(users)).is_ok();
+        }
+    }
+
     pub fn new(worker: Option<Worker>, graphics: bool) -> Self {
         Self {
+            avatars: HashMap::new(),
+            avatar_requested: HashSet::new(),
+            avatar_loading: false,
             notifications: crate::notifications::Notifications::default(),
             demo_images: HashMap::new(),
             demo_saved: HashMap::new(),
@@ -379,6 +431,7 @@ impl App {
                 (
                     id.clone(),
                     Person {
+                        avatar_url: String::new(),
                         display_name: name.clone(),
                         status_emoji: if id == "maya" {
                             ":coffee:".into()
@@ -909,6 +962,10 @@ impl App {
     }
     pub fn receive(&mut self, reply: Reply) {
         match reply {
+            Reply::Avatars(photos) => {
+                self.avatar_loading = false;
+                self.avatars.extend(photos);
+            }
             Reply::Bootstrap(result) => {
                 self.loading = false;
                 match result {

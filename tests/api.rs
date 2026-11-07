@@ -56,7 +56,7 @@ fn bootstrap_paginates_channels_and_resolves_dm_names() {
         ("200 OK", json!({"ok":true,"team":"Test","user_id":"U1"})),
         (
             "200 OK",
-            json!({"ok":true,"members":[{"id":"U2","profile":{"display_name":"Maya"}}]}),
+            json!({"ok":true,"members":[{"id":"U2","profile":{"display_name":"Maya", "image_48":"https://avatars.slack-edge.com/maya.png"}}]}),
         ),
         (
             "200 OK",
@@ -71,6 +71,10 @@ fn bootstrap_paginates_channels_and_resolves_dm_names() {
     let data = client.bootstrap().unwrap();
     assert_eq!(data.conversations.len(), 2);
     assert_eq!(data.conversations[1].label(), "@Maya");
+    assert_eq!(
+        data.people["U2"].avatar_url,
+        "https://avatars.slack-edge.com/maya.png"
+    );
     let requests = server.join().unwrap();
     assert!(requests.iter().all(|r| {
         r.to_lowercase()
