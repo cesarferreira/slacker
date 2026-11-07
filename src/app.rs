@@ -223,6 +223,7 @@ impl Viewer {
 }
 
 pub struct App {
+    pub notifications: crate::notifications::Notifications,
     pub workspace: String,
     pub me: String,
     pub users: HashMap<String, String>,
@@ -256,6 +257,7 @@ pub struct App {
 impl App {
     pub fn new(worker: Option<Worker>, graphics: bool) -> Self {
         Self {
+            notifications: crate::notifications::Notifications::default(),
             workspace: "slacker".into(),
             me: "you".into(),
             users: HashMap::new(),
@@ -529,18 +531,37 @@ impl App {
                 self.loading = false;
                 match result {
                     Ok(history) => {
+                        if self.thread.is_none()
+                            && let Some(channel) = self.current_id().map(str::to_owned)
+                        {
+                            self.notifications.observe(
+                                &channel,
+                                &history.messages,
+                                &self.me,
+                                append,
+                            );
+                        }
                         let selected_ts = self.messages.get(self.selected).map(|m| m.ts.clone());
-                        if self.thread.is_some() {
-                            if let Some(last) = history.messages.last() {
-                                self.thread_latest = Some(last.ts.clone());
-                            }
+                        if self.thread.is_some()
+                            && let Some(last) = history.messages.last()
+                        {
+                            self.thread_latest = Some(last.ts.clone());
                         }
                         if append || self.thread.is_some() {
                             self.messages.extend(history.messages);
                             self.messages.sort_by(|a, b| a.ts.cmp(&b.ts));
                             self.messages.dedup_by(|a, b| a.ts == b.ts);
                         } else {
+                            let reading = (self.mode == Mode::Read)
+                                .then(|| self.messages.get(self.selected).cloned())
+                                .flatten();
                             self.messages = history.messages;
+                            if let Some(reading) = reading
+                                && !self.messages.iter().any(|message| message.ts == reading.ts)
+                            {
+                                self.messages.push(reading);
+                                self.messages.sort_by(|a, b| a.ts.cmp(&b.ts));
+                            }
                         }
                         self.cursor = history.cursor;
                         self.selected = selected_ts

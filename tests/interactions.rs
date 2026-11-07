@@ -302,3 +302,27 @@ fn grouped_sidebar_keeps_direct_messages_clickable_and_scrolls_to_selection() {
     );
     assert_eq!(app.channel, dm_index);
 }
+
+#[test]
+fn refresh_keeps_the_message_open_in_the_full_reader() {
+    let mut app = App::demo(false);
+    app.demo = false;
+    app.selected = 0;
+    let reading = app.messages[0].ts.clone();
+    app.key(key(KeyCode::Char('o')));
+    app.read_scroll = 7;
+    app.receive(Reply::History {
+        id: app.generation,
+        append: false,
+        result: Ok(History {
+            messages: vec![Message {
+                ts: "1731000999.000001".into(),
+                text: "newest page".into(),
+                ..Default::default()
+            }],
+            cursor: "older".into(),
+        }),
+    });
+    assert_eq!(app.messages[app.selected].ts, reading);
+    assert_eq!(app.read_scroll, 7);
+}

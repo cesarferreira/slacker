@@ -100,17 +100,33 @@ tokens. Tokens are read from the environment, never saved by slacker.
 # Set SLACK_TOKEN in your environment, then:
 slacker
 slacker --channel engineering
-slacker --refresh 60
+slacker --bell
+slacker --refresh 0
 ```
 
 Only joined channels and existing DMs are listed. Messages load in pages of
 15; `PgUp` requests another page. Threads load from the oldest replies forward,
 and refresh adds replies after the last loaded timestamp while preserving loaded
-messages. Successful sends appear immediately. `R` refreshes manually. Automatic refresh is
-opt-in with `--refresh`; intervals below 60 seconds are clamped to 60. Slack
+messages. Successful sends appear immediately. `R` refreshes manually. Automatic refresh runs every 60 seconds by default. Set `--refresh 0` to disable
+it; nonzero intervals below 60 seconds are clamped to 60. Slack
 rate-limit responses show the server's retry delay. Sending is never retried
 automatically, and failed sends retain the draft. Drafts are kept separately
 per conversation and thread for the current session.
+
+### Unread title and sound
+
+The terminal title shows the open conversation and workspace. New messages from
+other people received while the terminal is unfocused add a count, such as
+`(3) slacker · #engineering · My workspace`. Returning to the terminal clears it.
+`--bell` also emits a terminal bell once per incoming batch; whether it plays a
+sound or flashes follows your terminal settings. The previous title is restored
+on exit, and focus reporting is disabled again.
+
+These are session counts for the open channel, observed during refresh. Initial
+history, older pages, your own messages, and thread-history pages stay quiet.
+They are not Slack's workspace-wide unread totals. Automatic refresh must be
+enabled for background alerts; terminals without focus reporting can still
+clear the count when you press a key or click.
 
 ### Keyboard and mouse
 
@@ -142,7 +158,7 @@ While composing, normal letter keys insert text rather than triggering actions.
 This is an initial single-workspace client inspired by
 [gammons/slk](https://github.com/gammons/slk), implemented independently in Rust
 with Ratatui. It uses Slack's Web API and manual/interval refresh. WebSocket live
-updates, notifications, multi-workspace switching, reactions, uploads, and
+updates, workspace-wide notifications, multi-workspace switching, reactions, uploads, and
 persistent history are not implemented yet. Image/video attachments use the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
 Previews download to temporary files that are removed when the viewer closes;

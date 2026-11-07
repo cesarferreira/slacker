@@ -3,10 +3,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::{MoveTo, RestorePosition, SavePosition},
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyEventKind,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, KeyEventKind,
     },
     execute,
+    terminal::SetTitle,
 };
 use slacker::{
     api::Slack,
@@ -36,8 +37,11 @@ struct Cli {
     #[arg(long, value_enum, default_value = "auto", global = true)]
     graphics: Graphics,
     /// Refresh interval in seconds (0 disables automatic refresh)
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 60)]
     refresh: u64,
+    /// Ring the terminal bell for new messages received while unfocused
+    #[arg(long)]
+    bell: bool,
     /// Start in a conversation by name or ID
     #[arg(long)]
     channel: Option<String>,
@@ -129,14 +133,25 @@ fn main() -> Result<()> {
     };
     let standalone = app.viewer.is_some();
     let mut terminal = ratatui::try_init()?;
-    let guard = TerminalGuard { graphics };
-    execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    let mut guard = TerminalGuard {
+        graphics,
+        title_saved: false,
+    };
+    execute!(
+        io::stdout(),
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        EnableFocusChange
+    )?;
+    io::stdout().write_all(b"\x1b[22;0t")?;
+    guard.title_saved = true;
     let result = run(
         &mut terminal,
         &mut app,
         standalone,
         cli.refresh,
         cli.channel,
+        cli.bell,
     );
     drop(app);
     drop(guard);
@@ -149,14 +164,24 @@ fn token() -> Option<String> {
 }
 struct TerminalGuard {
     graphics: bool,
+    title_saved: bool,
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.graphics {
             let _ = media::clear(&mut io::stdout());
         }
-        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            DisableFocusChange
+        );
         ratatui::restore();
+        if self.title_saved {
+            let _ = io::stdout().write_all(b"\x1b[23;0t");
+            let _ = io::stdout().flush();
+        }
     }
 }
 
@@ -166,28 +191,50 @@ fn run(
     standalone: bool,
     refresh: u64,
     mut initial_channel: Option<String>,
+    bell: bool,
 ) -> Result<()> {
     let mut ui = UiState::default();
     let mut last_refresh = Instant::now();
     let mut had_viewer = false;
+    let mut last_title = String::new();
     loop {
         app.poll();
-        if !app.conversations.is_empty() {
-            if let Some(name) = initial_channel.take() {
-                if let Some(i) = app
-                    .conversations
-                    .iter()
-                    .position(|c| c.name == name.trim_start_matches('#') || c.id == name)
-                {
-                    app.loading = false;
-                    app.open_channel(i);
-                } else {
-                    app.status = format!("Conversation {name} not found");
-                }
+        if !app.conversations.is_empty()
+            && let Some(name) = initial_channel.take()
+        {
+            if let Some(i) = app
+                .conversations
+                .iter()
+                .position(|c| c.name == name.trim_start_matches('#') || c.id == name)
+            {
+                app.loading = false;
+                app.open_channel(i);
+            } else {
+                app.status = format!("Conversation {name} not found");
             }
         }
+        let conversation = app
+            .conversations
+            .get(app.channel)
+            .map(|c| c.label())
+            .unwrap_or_else(|| {
+                if standalone {
+                    "Media".into()
+                } else {
+                    "Connecting…".into()
+                }
+            });
+        let title = app.notifications.title(&app.workspace, &conversation);
+        if title != last_title {
+            execute!(io::stdout(), SetTitle(&title))?;
+            last_title = title;
+        }
+        if app.notifications.take_bell() && bell {
+            io::stdout().write_all(b"\x07")?;
+            io::stdout().flush()?;
+        }
         if refresh > 0 && last_refresh.elapsed() >= Duration::from_secs(refresh.max(60)) {
-            if app.mode == Mode::Normal && app.viewer.is_none() && !app.loading && !app.sending {
+            if !standalone && !app.loading && !app.sending {
                 app.refresh(false);
             }
             last_refresh = Instant::now();
@@ -200,51 +247,63 @@ fn run(
             }
         }
         had_viewer = app.viewer.is_some();
-        if let Some(viewer) = &mut app.viewer {
-            if let Some(video) = &mut viewer.video {
-                if let Some(pixels) = video.poll() {
-                    viewer.last = Some(pixels);
-                    viewer.dirty = true;
-                }
-                if video.ended() && viewer.last.is_none() {
-                    viewer.note =
-                        "FFmpeg could not decode this video. Esc closes the viewer.".into();
-                }
+        if let Some(viewer) = &mut app.viewer
+            && let Some(video) = &mut viewer.video
+        {
+            if let Some(pixels) = video.poll() {
+                viewer.last = Some(pixels);
+                viewer.dirty = true;
+            }
+            if video.ended() && viewer.last.is_none() {
+                viewer.note = "FFmpeg could not decode this video. Esc closes the viewer.".into();
             }
         }
         terminal.draw(|frame| ui::draw(frame, app, &mut ui))?;
         if app.mode == Mode::Read {
             app.read_scroll = app.read_scroll.min(ui.read_scroll_max);
         }
-        if let Some(viewer) = &mut app.viewer {
-            if viewer.dirty && !ui.media_area.is_empty() {
-                if let Some(pixels) = &viewer.last {
-                    let (columns, rows) = pixels.fit(ui.media_area.width, ui.media_area.height);
-                    let x = ui.media_area.x + (ui.media_area.width - columns) / 2;
-                    let y = ui.media_area.y + (ui.media_area.height - rows) / 2;
-                    let mut out = io::stdout().lock();
-                    execute!(out, SavePosition, MoveTo(x, y))?;
-                    media::transmit(
-                        &mut out,
-                        &pixels.rgb,
-                        pixels.width,
-                        pixels.height,
-                        columns,
-                        rows,
-                    )?;
-                    execute!(out, RestorePosition)?;
-                    out.flush()?;
-                    viewer.dirty = false;
-                }
-            }
+        if let Some(viewer) = &mut app.viewer
+            && viewer.dirty
+            && !ui.media_area.is_empty()
+            && let Some(pixels) = &viewer.last
+        {
+            let (columns, rows) = pixels.fit(ui.media_area.width, ui.media_area.height);
+            let x = ui.media_area.x + (ui.media_area.width - columns) / 2;
+            let y = ui.media_area.y + (ui.media_area.height - rows) / 2;
+            let mut out = io::stdout().lock();
+            execute!(out, SavePosition, MoveTo(x, y))?;
+            media::transmit(
+                &mut out,
+                &pixels.rgb,
+                pixels.width,
+                pixels.height,
+                columns,
+                rows,
+            )?;
+            execute!(out, RestorePosition)?;
+            out.flush()?;
+            viewer.dirty = false;
         }
         if app.quit {
             break;
         }
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => app.key(key),
-                Event::Mouse(mouse) => ui::mouse(app, &mut ui, mouse),
+                Event::FocusGained => app.notifications.focus(true),
+                Event::FocusLost => app.notifications.focus(false),
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    app.notifications.focus(true);
+                    app.key(key);
+                }
+                Event::Mouse(mouse) => {
+                    if !matches!(
+                        mouse.kind,
+                        event::MouseEventKind::Moved | event::MouseEventKind::Drag(_)
+                    ) {
+                        app.notifications.focus(true);
+                    }
+                    ui::mouse(app, &mut ui, mouse);
+                }
                 Event::Paste(text) => match app.mode {
                     Mode::Compose if !app.sending => {
                         app.editor.insert(&slacker::app::safe_text(&text))
