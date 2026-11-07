@@ -49,16 +49,14 @@ pub fn clear(out: &mut impl Write) -> io::Result<()> {
 }
 
 pub fn supported() -> bool {
-    let term = std::env::var("TERM").unwrap_or_default();
-    let program = std::env::var("TERM_PROGRAM")
-        .unwrap_or_default()
-        .to_lowercase();
+    let identifiers =
+        ["TERM", "TERM_PROGRAM"].map(|key| std::env::var(key).unwrap_or_default().to_lowercase());
     std::env::var_os("TMUX").is_none()
-        && (term.contains("kitty")
-            || program.contains("kitty")
-            || program.contains("ghostty")
-            || program.contains("wezterm")
-            || std::env::var_os("KITTY_WINDOW_ID").is_some())
+        && (identifiers.iter().any(|identifier| {
+            ["kitty", "ghostty", "wezterm"]
+                .iter()
+                .any(|name| identifier.contains(name))
+        }) || std::env::var_os("KITTY_WINDOW_ID").is_some())
 }
 
 pub fn video_path(path: &Path) -> bool {
