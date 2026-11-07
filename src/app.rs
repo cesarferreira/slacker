@@ -224,6 +224,8 @@ impl Viewer {
 
 pub struct App {
     pub notifications: crate::notifications::Notifications,
+    pub demo_images: HashMap<String, crate::media::Pixels>,
+    demo_saved: HashMap<(String, Option<String>), Vec<Message>>,
     pub workspace: String,
     pub me: String,
     pub users: HashMap<String, String>,
@@ -258,6 +260,8 @@ impl App {
     pub fn new(worker: Option<Worker>, graphics: bool) -> Self {
         Self {
             notifications: crate::notifications::Notifications::default(),
+            demo_images: HashMap::new(),
+            demo_saved: HashMap::new(),
             workspace: "slacker".into(),
             me: "you".into(),
             users: HashMap::new(),
@@ -313,18 +317,60 @@ impl App {
             ..Default::default()
         })
         .collect();
+        if graphics {
+            app.demo_images = crate::demo::previews();
+        }
         app.load_demo();
         app
     }
     fn load_demo(&mut self) {
-        self.messages = vec![
-            Message { ts: "1731000000.000001".into(), user: "maya".into(), text: "Welcome to slacker. A little less chrome, a lot more conversation.".into(), ..Default::default() },
-            Message { ts: "1731000060.000001".into(), user: "leo".into(), text: "Keyboard or mouse, your choice. Click a channel on the left, or hit Ctrl+K to jump anywhere.".into(), reply_count: 2, ..Default::default() },
-            Message { ts: "1731000120.000001".into(), user: "maya".into(), text: "Select an attachment and press v for Kitty media. Videos play right here via FFmpeg. Try `slacker media clip.mp4` with a local file.".into(), ..Default::default() },
-            Message { ts: "1731000180.000001".into(), user: "you".into(), text: format!("Ready in #{}. Press i or click the composer to write. Demo messages stay on this machine.", self.conversations[self.channel].name), ..Default::default() },
-        ];
+        let channel = self.current_id().unwrap_or("").to_owned();
+        let key = (channel.clone(), self.thread.clone());
+        self.messages = self.demo_saved.get(&key).cloned().unwrap_or_else(|| {
+            if let Some(ts) = &self.thread {
+                self.demo_saved
+                    .get(&(channel, None))
+                    .and_then(|messages| messages.iter().find(|m| m.ts == *ts))
+                    .cloned()
+                    .map(crate::demo::thread)
+                    .unwrap_or_default()
+            } else {
+                crate::demo::messages()
+            }
+        });
         self.selected = self.messages.len().saturating_sub(1);
-        self.status = "DEMO • local only • ? shortcuts".into();
+        self.status = "Demo · messages stay on this device".into();
+    }
+    fn save_demo_messages(&mut self) {
+        if !self.demo {
+            return;
+        }
+        if let Some(channel) = self.current_id().map(str::to_owned) {
+            self.demo_saved.insert(
+                (channel.clone(), self.thread.clone()),
+                self.messages.clone(),
+            );
+            if self.thread.is_none() {
+                for parent in &self.messages {
+                    if let Some(thread) = self
+                        .demo_saved
+                        .get_mut(&(channel.clone(), Some(parent.ts.clone())))
+                        && let Some(root) = thread.first_mut()
+                    {
+                        *root = parent.clone();
+                    }
+                }
+            }
+            if let Some(ts) = &self.thread
+                && let Some(messages) = self.demo_saved.get_mut(&(channel, None))
+                && let Some(parent) = messages.iter_mut().find(|m| m.ts == *ts)
+            {
+                parent.reply_count = self.messages.len().saturating_sub(1);
+                if let Some(root) = self.messages.first() {
+                    parent.reactions = root.reactions.clone();
+                }
+            }
+        }
     }
     pub fn current_id(&self) -> Option<&str> {
         self.conversations.get(self.channel).map(|c| c.id.as_str())
@@ -340,6 +386,7 @@ impl App {
         matched.into_iter().map(|(_, i)| i).collect()
     }
     fn save_draft(&mut self) {
+        self.save_demo_messages();
         if let Some(id) = self.current_id().map(str::to_owned) {
             self.drafts
                 .insert((id, self.thread.clone()), std::mem::take(&mut self.editor));
@@ -417,18 +464,7 @@ impl App {
             self.cursor.clear();
             self.selected = 0;
             if self.demo {
-                self.messages.push(Message {
-                    ts: "1731000060.000001".into(),
-                    user: "leo".into(),
-                    text: "Keyboard or mouse, your choice.".into(),
-                    ..Default::default()
-                });
-                self.messages.push(Message {
-                    ts: "1731000070.000001".into(),
-                    user: "maya".into(),
-                    text: "Both work! Click Compose or press i to reply in this thread.".into(),
-                    ..Default::default()
-                });
+                self.load_demo();
             } else {
                 self.refresh(false);
             }
@@ -453,7 +489,8 @@ impl App {
             self.editor.cursor = 0;
             self.selected = self.messages.len() - 1;
             self.mode = Mode::Normal;
-            self.status = "Demo message added locally".into();
+            self.status = "Message sent · demo only".into();
+            self.save_demo_messages();
             return;
         }
         if let (Some(channel), Some(worker)) = (self.current_id().map(str::to_owned), &self.worker)
@@ -486,6 +523,15 @@ impl App {
             .get(self.selected)
             .and_then(|m| m.files.get(index).filter(|f| f.is_media()))
             .cloned();
+        if self.demo {
+            if let Some(file) = file {
+                match crate::demo::prepare(&file).and_then(Viewer::new) {
+                    Ok(viewer) => self.viewer = Some(viewer),
+                    Err(error) => self.status = format!("{error:#}"),
+                }
+            }
+            return;
+        }
         if let (Some(file), Some(worker)) = (file, &self.worker) {
             self.media_generation += 1;
             let id = self.media_generation;
@@ -504,6 +550,25 @@ impl App {
             });
         } else {
             self.status = "No image or video attached to the selected message".into();
+        }
+    }
+    pub fn toggle_demo_reaction(&mut self, message: usize, reaction: usize) {
+        if !self.demo {
+            return;
+        }
+        if let Some(reaction) = self
+            .messages
+            .get_mut(message)
+            .and_then(|m| m.reactions.get_mut(reaction))
+        {
+            if let Some(index) = reaction.users.iter().position(|user| user == &self.me) {
+                reaction.users.remove(index);
+                reaction.count = reaction.count.saturating_sub(1);
+            } else {
+                reaction.users.push(self.me.clone());
+                reaction.count += 1;
+            }
+            self.save_demo_messages();
         }
     }
     pub fn receive(&mut self, reply: Reply) {

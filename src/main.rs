@@ -33,8 +33,8 @@ struct Cli {
     /// Explore a local demo without connecting to Slack
     #[arg(long)]
     demo: bool,
-    /// Graphics mode; auto recognizes Kitty, Ghostty and WezTerm
-    #[arg(long, value_enum, default_value = "auto", global = true)]
+    /// Graphics mode; Kitty rendering is enabled by default
+    #[arg(long, value_enum, default_value = "kitty", global = true)]
     graphics: Graphics,
     /// Refresh interval in seconds (0 disables automatic refresh)
     #[arg(long, default_value_t = 60)]
@@ -170,6 +170,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.graphics {
             let _ = media::clear(&mut io::stdout());
+            let _ = media::clear_inline(&mut io::stdout());
         }
         let _ = execute!(
             io::stdout(),
@@ -197,6 +198,7 @@ fn run(
     let mut last_refresh = Instant::now();
     let mut had_viewer = false;
     let mut last_title = String::new();
+    let mut last_inline: Vec<ui::InlineImage> = Vec::new();
     loop {
         app.poll();
         if !app.conversations.is_empty()
@@ -259,6 +261,29 @@ fn run(
             }
         }
         terminal.draw(|frame| ui::draw(frame, app, &mut ui))?;
+        if ui.inline_images != last_inline {
+            let mut out = io::stdout().lock();
+            for image in &last_inline {
+                media::clear_id(&mut out, image.id)?;
+            }
+            for image in &ui.inline_images {
+                if let Some(pixels) = app.demo_images.get(&image.name) {
+                    execute!(out, SavePosition, MoveTo(image.rect.x, image.rect.y))?;
+                    media::transmit_id(
+                        &mut out,
+                        &pixels.rgb,
+                        pixels.width,
+                        pixels.height,
+                        image.rect.width,
+                        image.rect.height,
+                        image.id,
+                    )?;
+                    execute!(out, RestorePosition)?;
+                }
+            }
+            out.flush()?;
+            last_inline = ui.inline_images.clone();
+        }
         if app.mode == Mode::Read {
             app.read_scroll = app.read_scroll.min(ui.read_scroll_max);
         }
@@ -314,6 +339,10 @@ fn run(
                     _ => {}
                 },
                 Event::Resize(_, _) => {
+                    if app.graphics {
+                        media::clear_inline(&mut io::stdout())?;
+                    }
+                    last_inline.clear();
                     if let Some(viewer) = &mut app.viewer {
                         media::clear(&mut io::stdout())?;
                         viewer.dirty = true;

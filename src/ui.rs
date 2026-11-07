@@ -24,6 +24,8 @@ const GREEN: Color = Color::Rgb(133, 218, 177);
 pub enum Action {
     Channel(usize),
     Attachment(usize, usize),
+    Reaction(usize, usize),
+    ThreadAt(usize),
     Read,
     Message(usize),
     SwitchResult(usize),
@@ -42,9 +44,16 @@ pub struct Hit {
     pub action: Action,
     pub rect: Rect,
 }
+#[derive(Clone, PartialEq, Eq)]
+pub struct InlineImage {
+    pub name: String,
+    pub rect: Rect,
+    pub id: u32,
+}
 #[derive(Default)]
 pub struct UiState {
     pub hits: Vec<Hit>,
+    pub inline_images: Vec<InlineImage>,
     pub message_area: Rect,
     pub sidebar_area: Rect,
     pub media_area: Rect,
@@ -159,6 +168,7 @@ pub fn display_text(app: &App, text: &str) -> String {
 pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     let area = frame.area();
     ui.hits.clear();
+    ui.inline_images.clear();
     ui.media_area = Rect::default();
     frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
     if area.width < 38 || area.height < 12 {
@@ -259,8 +269,8 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
             chunks[1],
             &[
                 ("Esc Close", Action::Close),
-                ("t Thread", Action::Thread),
-                ("v Media", Action::Media),
+                ("Thread", Action::Thread),
+                ("Media", Action::Media),
             ],
         );
         scrollbar(
@@ -436,9 +446,10 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         ui,
         title_inner,
         &[
-            ("R Refresh", Action::Refresh),
-            ("t Thread", Action::Thread),
-            ("v Media", Action::Media),
+            ("Refresh", Action::Refresh),
+            ("Thread", Action::Thread),
+            ("Media", Action::Media),
+            ("Read", Action::Read),
             ("Back", Action::Back),
         ],
     );
@@ -446,6 +457,9 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     let width = main[1].width.saturating_sub(4).max(1) as usize;
     let mut heights = Vec::new();
     let mut attachment_rows = Vec::new();
+    let mut preview_rows = Vec::new();
+    let mut reaction_rows = Vec::new();
+    let mut reply_rows = Vec::new();
     let items: Vec<_> = app
         .messages
         .iter()
@@ -484,6 +498,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
                 }
             }
             let mut file_rows = Vec::new();
+            let mut previews = Vec::new();
             for (file_index, file) in m.files.iter().enumerate() {
                 if file.is_media() {
                     file_rows.push((file_index, lines.len() as u16));
@@ -502,10 +517,49 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
                     ),
                     Style::default().fg(GREEN),
                 )));
+                if app.graphics
+                    && main[1].height >= 10
+                    && let Some(image) = app.demo_images.get(&file.name)
+                {
+                    let (columns, rows) = image.fit(
+                        width.saturating_sub(2).min(48) as u16,
+                        main[1].height.saturating_sub(7).min(10),
+                    );
+                    previews.push((
+                        file_index,
+                        file.name.clone(),
+                        lines.len() as u16,
+                        columns,
+                        rows,
+                    ));
+                    for _ in 0..rows {
+                        lines.push(Line::from(" "));
+                    }
+                }
             }
+            let mut reactions = Vec::new();
+            if !m.reactions.is_empty() {
+                let row = lines.len() as u16;
+                let mut spans = vec![Span::raw(" ")];
+                let mut x = 1u16;
+                for (index, reaction) in m.reactions.iter().enumerate() {
+                    let label = format!(
+                        " {} {} ",
+                        crate::demo::emoji(&reaction.name),
+                        reaction.count
+                    );
+                    let length = label.width() as u16;
+                    reactions.push((index, row, x, length));
+                    spans.push(Span::styled(label, Style::default().fg(FG).bg(SELECTED)));
+                    spans.push(Span::raw(" "));
+                    x = x.saturating_add(length + 1);
+                }
+                lines.push(Line::from(spans));
+            }
+            let reply_row = (m.reply_count > 0).then_some(lines.len() as u16);
             if m.reply_count > 0 {
                 lines.push(Line::from(Span::styled(
-                    format!(" ↳ {} replies · t to open", m.reply_count),
+                    format!(" ↳ {} replies", m.reply_count),
                     Style::default().fg(ACCENT),
                 )));
             }
@@ -522,6 +576,9 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
                 }
             }
             attachment_rows.push(file_rows);
+            preview_rows.push(previews);
+            reaction_rows.push(reactions);
+            reply_rows.push(reply_row);
             heights.push(lines.len() as u16);
             ListItem::new(Text::from(lines))
         })
@@ -569,6 +626,37 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
                 });
             }
         }
+        for (file_index, name, row, columns, rows) in &preview_rows[index] {
+            if row + rows <= visible && ui.inline_images.len() < crate::media::INLINE_SLOTS as usize
+            {
+                let rect = Rect::new(main[1].x + 1, y + row, *columns, *rows);
+                ui.inline_images.push(InlineImage {
+                    name: name.clone(),
+                    rect,
+                    id: crate::media::INLINE_BASE + ui.inline_images.len() as u32,
+                });
+                ui.hits.push(Hit {
+                    rect,
+                    action: Action::Attachment(index, *file_index),
+                });
+            }
+        }
+        for (reaction, row, x, width) in &reaction_rows[index] {
+            if app.demo && *row < visible && *x < main[1].width {
+                ui.hits.push(Hit {
+                    rect: Rect::new(main[1].x + x, y + row, (*width).min(main[1].width - x), 1),
+                    action: Action::Reaction(index, *reaction),
+                });
+            }
+        }
+        if let Some(row) = reply_rows[index]
+            && row < visible
+        {
+            ui.hits.push(Hit {
+                rect: Rect::new(main[1].x, y + row, main[1].width, 1),
+                action: Action::ThreadAt(index),
+            });
+        }
         y += visible;
     }
     if app.messages.is_empty() {
@@ -583,32 +671,52 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
             main[1],
         );
     }
-    toolbar(
-        frame,
-        ui,
+    let hint = if app.sending {
+        "Sending…"
+    } else if app.mode == Mode::Compose {
+        "Enter to send · Alt+Enter for a new line"
+    } else {
+        "Click the message field to write"
+    };
+    frame.render_widget(
+        Paragraph::new(format!(" {hint}")).style(Style::default().fg(MUTED)),
         main[2],
-        &[
-            ("i Compose", Action::Compose),
-            ("Send ↵", Action::Send),
-            ("o Read", Action::Read),
-        ],
     );
-    let composer = border(
-        if app.thread.is_some() {
-            " Reply to thread · Enter sends · Alt+Enter newline "
-        } else {
-            " Message · Enter sends · Alt+Enter newline "
-        },
-        app.mode == Mode::Compose,
-    );
-    let composer_inner = composer.inner(main[3]);
+    let conversation = app
+        .conversations
+        .get(app.channel)
+        .map(|c| c.label())
+        .unwrap_or_default();
+    let title = if app.thread.is_some() {
+        " Reply to thread ".to_owned()
+    } else {
+        format!(" Message {conversation} ")
+    };
+    let composer = border(safe_text(&title), app.mode == Mode::Compose);
+    let mut composer_inner = composer.inner(main[3]);
     frame.render_widget(composer, main[3]);
+    if !app.editor.text.trim().is_empty() {
+        let send = Rect::new(
+            composer_inner.right().saturating_sub(8),
+            composer_inner.bottom().saturating_sub(1),
+            8.min(composer_inner.width),
+            1,
+        );
+        button(
+            frame,
+            ui,
+            send,
+            if app.sending { "Sending" } else { " Send → " },
+            Action::Send,
+        );
+        composer_inner.height = composer_inner.height.saturating_sub(1);
+    }
     ui.hits.push(Hit {
         rect: composer_inner,
         action: Action::Compose,
     });
     let text = if app.editor.text.is_empty() && app.mode != Mode::Compose {
-        "Press i or click here to write a message…"
+        "Write a message…"
     } else {
         &app.editor.text
     };
@@ -634,9 +742,9 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         ));
     }
     let mode = match app.mode {
-        Mode::Compose => "INSERT",
-        Mode::Switcher => "JUMP",
-        _ => "NORMAL",
+        Mode::Compose => "Typing",
+        Mode::Switcher => "Find conversation",
+        _ => "Browsing",
     };
     frame.render_widget(
         Paragraph::new(format!(" {mode} │ {}", safe_text(&app.status)))
@@ -647,6 +755,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         let popup = centered(area, 76, 24);
         frame.render_widget(Clear, popup);
         ui.hits.clear();
+        ui.inline_images.clear();
         let block = border(" Keyboard & mouse ", true).style(Style::default().bg(PANEL));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
@@ -668,6 +777,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         let popup = centered(area, 60, 18);
         frame.render_widget(Clear, popup);
         ui.hits.clear();
+        ui.inline_images.clear();
         let block =
             border(" Jump to conversation · Esc closes ", true).style(Style::default().bg(PANEL));
         let inner = block.inner(popup);
@@ -762,6 +872,12 @@ pub fn mouse(app: &mut App, ui: &mut UiState, event: MouseEvent) {
                 app.selected = i;
                 app.focus = Focus::Messages;
             }
+            Action::ThreadAt(index) => {
+                app.selected = index;
+                app.mode = Mode::Normal;
+                app.open_thread();
+            }
+            Action::Reaction(message, reaction) => app.toggle_demo_reaction(message, reaction),
             Action::Read => {
                 app.read_scroll = 0;
                 app.mode = Mode::Read;

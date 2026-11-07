@@ -72,12 +72,20 @@ cargo run -- media ~/Movies/clip.mp4
 ```
 
 Run in Kitty, Ghostty, or WezTerm for images and silent video playback.
+Kitty graphics are enabled by default; `--graphics off` disables them, and
+`--graphics auto` opts into terminal-name detection.
 Videos and animated GIFs need `ffmpeg` on your `PATH` (`brew install ffmpeg`
 on macOS). PNG, JPEG, and WebP previews use the built-in decoder. Media opens
 in a full-screen terminal viewer. `Space` pauses video; `Esc` closes it.
-`--graphics off` keeps chat usable in other terminals; `--graphics kitty`
-forces the protocol when automatic terminal detection misses it. Automatic
+`--graphics off` keeps chat usable in other terminals. Automatic
 graphics detection is disabled inside tmux; passthrough is not implemented.
+
+The offline demo includes two photo posts, a four-second video with a poster,
+emoji reactions, and threads with replies. Images appear directly in the chat.
+Click an image or video to open it, a reaction to toggle it locally, or a replies
+link to read and reply in the thread. Demo messages and replies stay available
+while switching conversations during the session. No Slack token or network is
+needed for the demo.
 
 ### Connect to Slack
 
@@ -136,8 +144,8 @@ clear the count when you press a key or click.
 | Focus conversations / messages | `h` / `l`, `Tab` |
 | Open conversation | `Enter` in the sidebar, or click its name |
 | Find a conversation | `Ctrl+K`, type a fuzzy query, `Enter`; click a result |
-| Compose | `i`, or click the composer |
-| Send | `Enter` in compose mode, or click Send |
+| Compose | Click the message field, or press `i` |
+| Send | `Enter` while typing, or click Send (shown for a nonempty draft) |
 | Newline | `Alt+Enter`; bracketed paste preserves newlines |
 | Open thread | `t`, `Enter` on a message, or click Thread |
 | Read a long message | `o` or click Read; `j` / `k`, page keys, or wheel scroll |
@@ -158,7 +166,7 @@ While composing, normal letter keys insert text rather than triggering actions.
 This is an initial single-workspace client inspired by
 [gammons/slk](https://github.com/gammons/slk), implemented independently in Rust
 with Ratatui. It uses Slack's Web API and manual/interval refresh. WebSocket live
-updates, workspace-wide notifications, multi-workspace switching, reactions, uploads, and
+updates, workspace-wide notifications, multi-workspace switching, changing reactions in live Slack, uploads, and
 persistent history are not implemented yet. Image/video attachments use the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
 Previews download to temporary files that are removed when the viewer closes;

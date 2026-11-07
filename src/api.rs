@@ -65,6 +65,14 @@ impl Attachment {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+pub struct Reaction {
+    pub name: String,
+    pub count: usize,
+    #[serde(default)]
+    pub users: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Message {
     pub ts: String,
     #[serde(default)]
@@ -77,6 +85,8 @@ pub struct Message {
     pub reply_count: usize,
     #[serde(default)]
     pub files: Vec<Attachment>,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
 }
 
 pub struct Snapshot {

@@ -15,6 +15,8 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 
 pub const IMAGE_ID: u32 = 31;
+pub const INLINE_BASE: u32 = 100;
+pub const INLINE_SLOTS: u32 = 16;
 
 pub fn transmit(
     out: &mut impl Write,
@@ -24,6 +26,18 @@ pub fn transmit(
     columns: u16,
     rows: u16,
 ) -> io::Result<()> {
+    transmit_id(out, rgb, width, height, columns, rows, IMAGE_ID)
+}
+
+pub fn transmit_id(
+    out: &mut impl Write,
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    columns: u16,
+    rows: u16,
+    id: u32,
+) -> io::Result<()> {
     let data = STANDARD.encode(rgb);
     let chunks = data.as_bytes().chunks(4096);
     let total = chunks.len();
@@ -31,7 +45,7 @@ pub fn transmit(
         if i == 0 {
             write!(
                 out,
-                "\x1b_Ga=T,f=24,s={width},v={height},i={IMAGE_ID},c={columns},r={rows},C=1,q=2,"
+                "\x1b_Ga=T,f=24,s={width},v={height},i={id},c={columns},r={rows},C=1,q=2,"
             )?;
         } else {
             write!(out, "\x1b_G")?;
@@ -46,6 +60,18 @@ pub fn transmit(
 pub fn clear(out: &mut impl Write) -> io::Result<()> {
     write!(out, "\x1b_Ga=d,d=I,i={IMAGE_ID},q=2;\x1b\\")?;
     out.flush()
+}
+
+pub fn clear_id(out: &mut impl Write, id: u32) -> io::Result<()> {
+    write!(out, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\")?;
+    out.flush()
+}
+
+pub fn clear_inline(out: &mut impl Write) -> io::Result<()> {
+    for id in INLINE_BASE..INLINE_BASE + INLINE_SLOTS {
+        clear_id(out, id)?;
+    }
+    Ok(())
 }
 
 pub fn supported() -> bool {
