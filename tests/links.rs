@@ -6,6 +6,24 @@ use slacker::{
 };
 
 #[test]
+fn mention_lookup_handles_adjacent_unknown_and_incomplete_tokens() {
+    let mut app = App::demo(false);
+    app.users.insert("U123".into(), "李 Ada".into());
+    for (input, expected) in [
+        ("<@maya><@U123> <@missing>", "@Maya Chen@李 Ada <@missing>"),
+        ("before <@unfinished", "before <@unfinished"),
+        ("<@broken <@U123>>", "<@broken @李 Ada>"),
+        ("&lt;@U123&gt; &amp; <@U123>", "<@U123> & @李 Ada"),
+        (
+            "ordinary text without mentions",
+            "ordinary text without mentions",
+        ),
+    ] {
+        assert_eq!(ui::display_text(&app, input), expected);
+    }
+}
+
+#[test]
 fn slack_links_render_labels_and_keep_destinations_readable() {
     let app = App::demo(false);
     for (input, expected) in [

@@ -30,11 +30,35 @@ fn entities(text: &str) -> String {
 }
 
 fn plain(text: &str, users: &HashMap<String, String>) -> String {
-    let mut text = text.to_owned();
-    for (id, name) in users {
-        text = text.replace(&format!("<@{id}>"), &format!("@{name}"));
+    // Resolve only IDs that actually occur in the text. Scanning the workspace's
+    // entire user directory per fragment makes redraw cost scale with unrelated users.
+    let mut rendered = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<@") {
+        rendered.push_str(&rest[..start]);
+        let tail = &rest[start + 2..];
+        let Some(end) = tail.find(['<', '>']) else {
+            rendered.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        if tail.as_bytes()[end] == b'>' {
+            if let Some(name) = users.get(&tail[..end]) {
+                rendered.push('@');
+                rendered.push_str(name);
+            } else {
+                rendered.push_str("<@");
+                rendered.push_str(&tail[..end + 1]);
+            }
+            rest = &tail[end + 1..];
+        } else {
+            rendered.push_str("<@");
+            rendered.push_str(&tail[..end]);
+            rest = &tail[end..];
+        }
     }
-    safe_text(&entities(&text))
+    rendered.push_str(rest);
+    safe_text(&entities(&rendered))
 }
 
 pub struct Link {
