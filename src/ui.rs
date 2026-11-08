@@ -952,15 +952,41 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
     } else {
         Some(selected)
     });
-    frame.render_stateful_widget(
-        List::new(items)
-            .highlight_style(Style::default().bg(Color::Rgb(47, 57, 73)))
-            .style(Style::default().fg(CHAT_FG).bg(CHAT_BG)),
-        main[1],
-        state,
-    );
-    let offset = state.offset();
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::Rgb(47, 57, 73)))
+        .style(Style::default().fg(CHAT_FG).bg(CHAT_BG));
+    // Let the list resolve its selected item and scrolling before measuring the
+    // complete visible messages. Keep chronological order while anchoring the tail.
+    frame.render_stateful_widget(&list, main[1], state);
+    let mut used_height = 0;
+    let mut visible_count = 0;
+    for height in heights.iter().skip(state.offset()) {
+        if *height > main[1].height.saturating_sub(used_height) {
+            break;
+        }
+        used_height += height;
+        visible_count += 1;
+    }
     let content_lines: usize = heights.iter().map(|h| *h as usize).sum();
+    let at_latest = selected >= messages.len().saturating_sub(1);
+    let padding = if used_height > 0 && (at_latest || content_lines <= main[1].height as usize) {
+        main[1].height.saturating_sub(used_height)
+    } else {
+        0
+    };
+    if padding > 0 {
+        frame.render_widget(Clear, main[1]);
+        frame.render_widget(
+            Block::default().style(Style::default().fg(CHAT_FG).bg(CHAT_BG)),
+            main[1],
+        );
+        frame.render_stateful_widget(
+            &list,
+            Rect::new(main[1].x, main[1].y + padding, main[1].width, used_height),
+            state,
+        );
+    }
+    let offset = state.offset();
     let scrolled_lines: usize = heights.iter().take(offset).map(|h| *h as usize).sum();
     scrollbar(
         frame,
@@ -969,8 +995,8 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
         scrolled_lines,
         main[1].height as usize,
     );
-    let mut y = main[1].y;
-    for (index, height) in heights.iter().enumerate().skip(offset) {
+    let mut y = main[1].y + padding;
+    for (index, height) in heights.iter().enumerate().skip(offset).take(visible_count) {
         let visible = (*height).min(main[1].bottom().saturating_sub(y));
         if visible == 0 {
             break;

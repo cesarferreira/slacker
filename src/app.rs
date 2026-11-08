@@ -1321,6 +1321,11 @@ impl App {
                             (&mut self.messages, &mut self.selected, &mut self.cursor)
                         };
                         let selected_ts = messages.get(*selected).map(|m| m.ts.clone());
+                        let reading_this_feed = self.mode == Mode::Read
+                            && (thread.is_some() == (self.focus == Focus::Thread));
+                        let follow_latest = !reading_this_feed
+                            && (messages.is_empty()
+                                || *selected >= messages.len().saturating_sub(1));
                         let authoritative = !append && thread.is_none();
                         let retain_older = authoritative && !history.cursor.is_empty();
                         let reading = (self.mode == Mode::Read)
@@ -1344,9 +1349,13 @@ impl App {
                         // locally sent message cannot establish contiguous history.
                         // Revisiting cached rows is preferable to silently skipping a gap.
                         *cursor = history.cursor;
-                        *selected = selected_ts
-                            .and_then(|ts| messages.iter().position(|m| m.ts == ts))
-                            .unwrap_or_else(|| messages.len().saturating_sub(1));
+                        *selected = if follow_latest {
+                            messages.len().saturating_sub(1)
+                        } else {
+                            selected_ts
+                                .and_then(|ts| messages.iter().position(|m| m.ts == ts))
+                                .unwrap_or_else(|| messages.len().saturating_sub(1))
+                        };
                         self.status = "Updated • R refresh • ? shortcuts".into();
                         self.save_cache();
                     }

@@ -203,6 +203,10 @@ a Slack-provided preview stay clickable without a card.
 
 Drag the divider beside the sidebar to resize it. Clicking a replies link opens
 an independent thread panel on the right; drag its divider to adjust its width.
+Channel and thread messages sit above the composer, with empty space above short
+conversations. New messages follow automatically only when you're already at the
+latest message; scrolling into older history or opening the full-message reader
+keeps your reading position.
 Channel and thread drafts stay separate, and sending keeps the composer focused.
 Scrolling another pane preserves your typing destination.
 

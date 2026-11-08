@@ -134,8 +134,15 @@ fn current_day_has_a_centered_today_separator() {
     let mut ui = UiState::default();
     terminal.draw(|f| ui::draw(f, &app, &mut ui)).unwrap();
     let buffer = terminal.backend().buffer();
+    let message_top = ui
+        .hits
+        .iter()
+        .find(|h| h.action == ui::Action::Message(0))
+        .unwrap()
+        .rect
+        .y;
     let line: String = (ui.message_area.x..ui.message_area.right())
-        .map(|x| buffer[(x, ui.message_area.y)].symbol())
+        .map(|x| buffer[(x, message_top)].symbol())
         .collect();
     assert!(line.contains("Today"), "missing date separator: {line}");
     let label = line.find("Today").unwrap();
@@ -237,7 +244,14 @@ fn photos_without_graphics_use_pixel_cells_and_keep_text_clear() {
     let mut ui = UiState::default();
     terminal.draw(|f| ui::draw(f, &app, &mut ui)).unwrap();
     assert!(ui.inline_images.is_empty());
-    let pixel = &terminal.backend().buffer()[(ui.message_area.x + 1, ui.message_area.y + 1)];
+    let message_top = ui
+        .hits
+        .iter()
+        .find(|h| h.action == ui::Action::Message(0))
+        .unwrap()
+        .rect
+        .y;
+    let pixel = &terminal.backend().buffer()[(ui.message_area.x + 1, message_top + 1)];
     assert_eq!(pixel.symbol(), "▀");
     assert_eq!(pixel.fg, ratatui::style::Color::Rgb(180, 180, 180));
 }
