@@ -349,6 +349,15 @@ fn sign_in_to_desktop() -> Result<()> {
 }
 
 pub fn connect(requested: Option<&str>, choose_again: bool) -> Result<Slack> {
+    connect_inner(requested, choose_again, true)
+}
+
+/// Let the TUI restore cached history before the network validates the session.
+pub fn connect_for_app(requested: Option<&str>) -> Result<Slack> {
+    connect_inner(requested, false, false)
+}
+
+fn connect_inner(requested: Option<&str>, choose_again: bool, validate: bool) -> Result<Slack> {
     let mut workspaces = discover();
     if workspaces.is_empty() {
         if !io::stdin().is_terminal() {
@@ -391,9 +400,13 @@ pub fn connect(requested: Option<&str>, choose_again: bool) -> Result<Slack> {
     let token=tokens.remove(&workspace.team_id).context("This workspace has no active desktop session. Open it in Slack desktop, then retry slacker auth.")?;
     let cookie = desktop_cookie(&workspace.profile)?;
     let mut client = Slack::with_session(token, cookie, &workspace.domain)?;
-    client.validate().context("Slack could not validate this desktop session. Open Slack desktop and run slacker auth again.")?;
+    if validate {
+        client.validate().context("Slack could not validate this desktop session. Open Slack desktop and run slacker auth again.")?;
+    }
     save_preference(&workspace)?;
-    println!("Connected to {}.", workspace.name);
+    if validate {
+        println!("Connected to {}.", workspace.name);
+    }
     Ok(client)
 }
 

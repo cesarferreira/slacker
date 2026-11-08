@@ -26,6 +26,7 @@ const CHAT_CHIP: Color = Color::Rgb(57, 67, 85);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    Link(usize),
     Channel(usize),
     Attachment(usize, usize),
     Reaction(usize, usize),
@@ -70,6 +71,8 @@ enum Divider {
 }
 #[derive(Default)]
 pub struct UiState {
+    pub link_targets: Vec<String>,
+    pub pending_url: Option<String>,
     pub hits: Vec<Hit>,
     pub inline_images: Vec<InlineImage>,
     pub message_area: Rect,
@@ -183,16 +186,171 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 pub fn display_text(app: &App, text: &str) -> String {
-    let mut text = text.to_owned();
-    for (id, name) in &app.users {
-        text = text.replace(&format!("<@{id}>"), &format!("@{name}"));
+    crate::links::parse(text, &app.users).text
+}
+
+fn link_style() -> Style {
+    Style::default()
+        .fg(CHAT_MUTED)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
+fn append_content(
+    target: &mut crate::links::Wrapped,
+    mut content: crate::links::Wrapped,
+    card: bool,
+) {
+    let row = target.lines.len();
+    for link in &mut content.links {
+        link.row += row;
+        if card {
+            link.column += 2;
+        }
     }
-    safe_text(
-        &text
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&"),
-    )
+    if card {
+        for line in &mut content.lines {
+            line.spans
+                .insert(0, Span::styled("│ ", Style::default().fg(CHAT_MUTED)));
+        }
+    }
+    target.lines.extend(content.lines);
+    target.links.extend(content.links);
+}
+
+fn preview_field(
+    app: &App,
+    field: &crate::api::PreviewField,
+    width: usize,
+) -> crate::links::Wrapped {
+    let mut result = crate::links::wrap(
+        &crate::links::parse(&field.title, &app.users),
+        width,
+        link_style(),
+    );
+    for line in &mut result.lines {
+        line.style = Style::default().fg(CHAT_MUTED).add_modifier(Modifier::BOLD);
+    }
+    append_content(
+        &mut result,
+        crate::links::wrap(
+            &crate::links::parse(&field.value, &app.users),
+            width,
+            link_style(),
+        ),
+        false,
+    );
+    result
+}
+
+fn columns(
+    mut left: crate::links::Wrapped,
+    mut right: crate::links::Wrapped,
+    width: usize,
+) -> crate::links::Wrapped {
+    for link in &mut right.links {
+        link.column += (width + 2) as u16;
+    }
+    let rows = left.lines.len().max(right.lines.len());
+    left.lines.resize(rows, Line::default());
+    right.lines.resize(rows, Line::default());
+    for (line, other) in left.lines.iter_mut().zip(right.lines) {
+        line.spans.push(Span::raw(
+            " ".repeat(width.saturating_sub(line.width()) + 2),
+        ));
+        line.spans.extend(other.spans.into_iter().map(|mut span| {
+            span.style = other.style.patch(span.style);
+            span
+        }));
+    }
+    left.links.extend(right.links);
+    left
+}
+
+fn message_content(
+    app: &App,
+    message: &crate::api::Message,
+    width: usize,
+) -> crate::links::Wrapped {
+    let mut result = crate::links::wrap(
+        &crate::links::parse(&message.text, &app.users),
+        width,
+        link_style(),
+    );
+    let card_width = width.saturating_sub(2).max(1);
+    for preview in message.attachments.iter().take(4) {
+        let title = [&preview.title, &preview.service_name]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        let url = [
+            &preview.title_link,
+            &preview.original_url,
+            &preview.from_url,
+        ]
+        .into_iter()
+        .find_map(|url| crate::links::valid_url(url))
+        .unwrap_or("");
+        if !title.is_empty() {
+            let title = crate::links::Formatted::link(display_text(app, &title), url);
+            let mut content = crate::links::wrap(
+                &title,
+                card_width,
+                link_style().add_modifier(Modifier::BOLD),
+            );
+            for line in &mut content.lines {
+                line.style = Style::default().add_modifier(Modifier::BOLD);
+            }
+            append_content(&mut result, content, true);
+        }
+        let text = if preview.text.is_empty() && title.is_empty() {
+            &preview.fallback
+        } else {
+            &preview.text
+        };
+        if !text.is_empty() {
+            append_content(
+                &mut result,
+                crate::links::wrap(
+                    &crate::links::parse(text, &app.users),
+                    card_width,
+                    link_style(),
+                ),
+                true,
+            );
+        }
+        let mut fields = preview.fields.iter().take(8).peekable();
+        while let Some(field) = fields.next() {
+            let content = if card_width >= 40
+                && field.short
+                && fields.peek().is_some_and(|other| other.short)
+            {
+                let other = fields.next().unwrap();
+                let left_width = (card_width - 2) / 2;
+                columns(
+                    preview_field(app, field, left_width),
+                    preview_field(app, other, card_width - left_width - 2),
+                    left_width,
+                )
+            } else {
+                preview_field(app, field, card_width)
+            };
+            append_content(&mut result, content, true);
+        }
+    }
+    result
+}
+
+fn link_hit(ui: &mut UiState, area: Rect, x: u16, y: u16, width: u16, url: &str) {
+    if !area.contains(Position::new(x, y)) || width == 0 {
+        return;
+    }
+    let index = ui.link_targets.len();
+    ui.link_targets.push(url.into());
+    ui.hits.push(Hit {
+        action: Action::Link(index),
+        rect: Rect::new(x, y, width.min(area.right() - x), 1),
+    });
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
@@ -599,6 +757,7 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
     let mut reaction_rows = Vec::new();
     let mut reply_rows = Vec::new();
     let mut date_rows = Vec::new();
+    let mut link_rows = Vec::new();
     let mut previous_date = None;
     let items: Vec<_> = messages
         .iter()
@@ -634,12 +793,11 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
                         .add_modifier(Modifier::ITALIC),
                 ),
             ])];
-            let text = display_text(app, &m.text);
-            for paragraph in text.split('\n') {
-                for line in textwrap::wrap(paragraph, width) {
-                    lines.push(Line::from(line.into_owned()));
-                }
+            let mut content = message_content(app, m, width);
+            for link in &mut content.links {
+                link.row += lines.len();
             }
+            lines.extend(content.lines);
             let mut file_rows = Vec::new();
             let mut previews = Vec::new();
             for (file_index, file) in m.files.iter().enumerate() {
@@ -738,6 +896,7 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
             }
             // Keep a single long message navigable without forcing other rows offscreen.
             let max_lines = main[1].height.max(1) as usize;
+            let truncated = lines.len() > max_lines;
             if lines.len() > max_lines {
                 lines.truncate(max_lines);
                 if let Some(last) = lines.last_mut() {
@@ -769,6 +928,15 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
                     .collect::<Vec<_>>(),
             );
             reply_rows.push(reply_row.map(|r| r + date_height));
+            content.links.retain(|link| {
+                link.row + (date_height as usize)
+                    < lines.len().saturating_sub(usize::from(truncated))
+            });
+            for link in &mut content.links {
+                link.row += date_height as usize;
+                link.column += gutter;
+            }
+            link_rows.push(content.links);
             date_rows.push(date_height);
             heights.push(lines.len() as u16);
             ListItem::new(Text::from(lines))
@@ -918,6 +1086,18 @@ fn draw_feed(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect, thread:
                 action: Action::ThreadAt(index),
             });
         }
+        for link in &link_rows[index] {
+            if link.row < visible as usize {
+                link_hit(
+                    ui,
+                    main[1],
+                    main[1].x + link.column,
+                    y + link.row as u16,
+                    link.width,
+                    &link.url,
+                );
+            }
+        }
         y += visible;
     }
     if messages.is_empty() {
@@ -1018,6 +1198,7 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
     ui.visible_people.clear();
     ui.visible_avatars.clear();
     ui.hits.clear();
+    ui.link_targets.clear();
     ui.inline_images.clear();
     ui.media_area = Rect::default();
     frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
@@ -1087,15 +1268,12 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
         let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
         let mut lines = Vec::new();
         let mut attachment_lines = Vec::new();
+        let mut links = Vec::new();
         let (messages, selected) = app.active_messages();
         if let Some(message) = messages.get(selected) {
-            for line in display_text(app, &message.text).split('\n') {
-                lines.extend(
-                    textwrap::wrap(line, chunks[0].width.max(1) as usize)
-                        .into_iter()
-                        .map(|s| Line::from(s.into_owned())),
-                );
-            }
+            let content = message_content(app, message, chunks[0].width.max(1) as usize);
+            lines.extend(content.lines);
+            links = content.links;
             for (index, file) in message.files.iter().enumerate() {
                 if file.is_media() {
                     attachment_lines.push((index, lines.len()));
@@ -1119,6 +1297,18 @@ pub fn draw(frame: &mut Frame, app: &App, ui: &mut UiState) {
                 .style(Style::default().fg(FG)),
             chunks[0],
         );
+        for link in links {
+            if link.row >= scroll && link.row - scroll < chunks[0].height as usize {
+                link_hit(
+                    ui,
+                    chunks[0],
+                    chunks[0].x + link.column,
+                    chunks[0].y + (link.row - scroll) as u16,
+                    link.width,
+                    &link.url,
+                );
+            }
+        }
         toolbar(
             frame,
             ui,
@@ -1463,6 +1653,15 @@ pub fn mouse(app: &mut App, ui: &mut UiState, event: MouseEvent) {
             ))
         .then_some(app.focus);
         match hit.action {
+            Action::Link(index) => {
+                if let Some(url) = ui
+                    .link_targets
+                    .get(index)
+                    .filter(|url| crate::links::valid_url(url).is_some())
+                {
+                    ui.pending_url = Some(url.clone());
+                }
+            }
             Action::Channel(index) | Action::SwitchResult(index) => {
                 ui.manual_sidebar_scroll = false;
                 ui.manual_people_scroll = false;

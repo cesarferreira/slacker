@@ -2,10 +2,10 @@ use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Conversation {
     pub id: String,
     #[serde(default)]
@@ -38,7 +38,7 @@ impl Conversation {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Attachment {
     #[serde(default)]
     pub name: String,
@@ -66,7 +66,7 @@ impl Attachment {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Reaction {
     pub name: String,
     pub count: usize,
@@ -74,7 +74,45 @@ pub struct Reaction {
     pub users: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PreviewField {
+    #[serde(default, deserialize_with = "null_default")]
+    pub title: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub value: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub short: bool,
+}
+
+fn null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LinkPreview {
+    #[serde(default, deserialize_with = "null_default")]
+    pub title: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub title_link: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub from_url: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub original_url: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub text: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub fallback: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub service_name: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub fields: Vec<PreviewField>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Message {
     pub ts: String,
     #[serde(default)]
@@ -89,6 +127,8 @@ pub struct Message {
     pub files: Vec<Attachment>,
     #[serde(default)]
     pub reactions: Vec<Reaction>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub attachments: Vec<LinkPreview>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,7 +140,7 @@ pub enum Presence {
     Unknown,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Person {
     pub avatar_url: String,
     pub display_name: String,
@@ -109,6 +149,7 @@ pub struct Person {
     pub is_bot: bool,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Snapshot {
     pub workspace: String,
     pub me: String,
@@ -175,6 +216,20 @@ pub struct Slack {
 }
 
 impl Slack {
+    /// An opaque, credential-scoped namespace permits offline restore without
+    /// storing tokens or risking reuse by another account. Rotation starts cold.
+    pub fn cache_namespace(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(self.base_url.as_bytes());
+        hash.update([0]);
+        hash.update(self.token.as_bytes());
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     pub fn new(token: String) -> Result<Self> {
         Self::with_base_url(token, "https://slack.com/api/".into())
     }
@@ -304,9 +359,15 @@ impl Slack {
 
     pub fn bootstrap(&self) -> Result<Snapshot> {
         let auth = self.request("auth.test", &[])?;
+        let mut client = self.clone();
+        if self.session
+            && let Some(url) = auth["url"].as_str()
+        {
+            client.base_url = session_api_url(url)?;
+        }
         let mut users = HashMap::new();
         let mut people = HashMap::new();
-        for user in self.pages("users.list", "members", &[("limit", "200")])? {
+        for user in client.pages("users.list", "members", &[("limit", "200")])? {
             let id = user["id"].as_str().unwrap_or("");
             let name = [
                 user["profile"]["display_name"].as_str(),
@@ -341,7 +402,7 @@ impl Slack {
         }
         let mut conversations = Vec::new();
         let entries = if self.session {
-            let boot = self.request(
+            let boot = client.request(
                 "client.userBoot",
                 &[
                     ("version_all_channels", "false"),
@@ -361,7 +422,7 @@ impl Slack {
             }
             entries
         } else {
-            self.pages(
+            client.pages(
                 "conversations.list",
                 "channels",
                 &[

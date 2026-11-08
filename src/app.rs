@@ -127,6 +127,7 @@ pub enum Job {
 }
 
 pub enum Reply {
+    Cache(crate::cache::Event),
     Avatars(Vec<(String, crate::media::Pixels)>),
     Bootstrap(Result<Snapshot>),
     Counts(Result<HashMap<String, usize>>),
@@ -163,7 +164,7 @@ impl Worker {
     pub fn new(slack: Slack) -> Self {
         let (jobs, rx) = mpsc::channel();
         let (events, replies) = mpsc::channel();
-        let client = slack.clone();
+        let mut client = slack.clone();
         let tx = events.clone();
         thread::spawn(move || {
             for job in rx {
@@ -200,7 +201,9 @@ impl Worker {
                         });
                         continue;
                     }
-                    Job::Bootstrap => Reply::Bootstrap(client.bootstrap()),
+                    Job::Bootstrap => {
+                        Reply::Bootstrap(client.validate().and_then(|()| client.bootstrap()))
+                    }
                     Job::History {
                         id,
                         channel,
@@ -274,6 +277,7 @@ impl Viewer {
 
 #[derive(Default)]
 pub struct ThreadView {
+    pub fresh: bool,
     pub messages: Vec<Message>,
     pub selected: usize,
     pub editor: Editor,
@@ -286,6 +290,10 @@ pub struct ThreadView {
 }
 
 pub struct App {
+    cache: Option<crate::cache::Worker>,
+    saved_feeds: HashMap<(String, Option<String>), crate::cache::Feed>,
+    channel_fresh: bool,
+    bootstrap_failed: bool,
     pub avatars: HashMap<String, crate::media::Pixels>,
     avatar_requested: HashSet<String>,
     avatar_loading: bool,
@@ -336,6 +344,126 @@ pub struct App {
 }
 
 impl App {
+    pub fn enable_cache(&mut self, path: std::path::PathBuf, namespace: String) {
+        if self.demo {
+            return;
+        }
+        if let Some(worker) = &self.worker {
+            let events = worker.events.clone();
+            self.cache = Some(crate::cache::Worker::new(path, namespace, move |event| {
+                let _ = events.send(Reply::Cache(event));
+            }));
+        }
+    }
+
+    fn feed(
+        messages: &[Message],
+        selected: usize,
+        cursor: &str,
+        read_scroll: usize,
+    ) -> crate::cache::Feed {
+        crate::cache::Feed {
+            messages: messages.to_vec(),
+            cursor: cursor.into(),
+            selected_ts: messages.get(selected).map(|m| m.ts.clone()),
+            read_scroll,
+        }
+    }
+
+    fn remember(&mut self, channel: String, thread: Option<String>, mut feed: crate::cache::Feed) {
+        if self.demo {
+            return;
+        }
+        if let Some(cache) = &self.cache {
+            cache.save(channel.clone(), thread.clone(), feed.clone());
+        }
+        let excess = feed
+            .messages
+            .len()
+            .saturating_sub(crate::cache::MAX_MESSAGES);
+        if excess > 0 {
+            feed.cursor.clear();
+        }
+        feed.messages.drain(..excess);
+        let key = (channel, thread);
+        if self.saved_feeds.len() >= crate::cache::MAX_FEEDS
+            && !self.saved_feeds.contains_key(&key)
+            && let Some(old) = self.saved_feeds.keys().next().cloned()
+        {
+            self.saved_feeds.remove(&old);
+        }
+        self.saved_feeds.insert(key, feed);
+    }
+
+    pub fn save_cache(&mut self) {
+        if self.demo {
+            return;
+        }
+        let Some(channel) = self.current_id().map(str::to_owned) else {
+            return;
+        };
+        if self.channel_fresh || !self.messages.is_empty() {
+            let feed = Self::feed(
+                &self.messages,
+                self.selected,
+                &self.cursor,
+                self.read_scroll,
+            );
+            self.remember(channel.clone(), None, feed);
+        }
+        if let (Some(root), Some(view)) = (&self.thread, &self.thread_view)
+            && (view.fresh || view.messages.len() > 1)
+        {
+            let feed = Self::feed(
+                &view.messages,
+                view.selected,
+                &view.cursor,
+                view.read_scroll,
+            );
+            self.remember(channel.clone(), Some(root.clone()), feed);
+        }
+        if let Some(cache) = &self.cache {
+            cache.select(channel);
+        }
+    }
+
+    fn restore_feed(&mut self, feed: crate::cache::Feed, thread: bool) {
+        let selected = feed
+            .selected_ts
+            .as_ref()
+            .and_then(|ts| feed.messages.iter().position(|m| &m.ts == ts))
+            .unwrap_or_else(|| feed.messages.len().saturating_sub(1));
+        if thread {
+            if let Some(view) = &mut self.thread_view {
+                view.messages = feed.messages;
+                // A bounded disk cache may have dropped the root. Never replace a reply with it.
+                if let Some(parent) = self
+                    .messages
+                    .iter()
+                    .find(|m| Some(&m.ts) == self.thread.as_ref())
+                {
+                    if view.messages.first().is_some_and(|m| m.ts == parent.ts) {
+                        view.messages[0] = parent.clone();
+                    } else {
+                        view.messages.insert(0, parent.clone());
+                    }
+                }
+                view.selected = feed
+                    .selected_ts
+                    .as_ref()
+                    .and_then(|ts| view.messages.iter().position(|m| &m.ts == ts))
+                    .unwrap_or(selected);
+                view.cursor = feed.cursor;
+                view.read_scroll = feed.read_scroll;
+            }
+        } else {
+            self.messages = feed.messages;
+            self.selected = selected;
+            self.cursor = feed.cursor;
+            self.read_scroll = feed.read_scroll;
+        }
+    }
+
     pub fn refresh_avatars(&mut self, visible: &[String]) {
         let Some(worker) = &self.worker else {
             return;
@@ -367,6 +495,10 @@ impl App {
 
     pub fn new(worker: Option<Worker>, graphics: bool) -> Self {
         Self {
+            cache: None,
+            saved_feeds: HashMap::new(),
+            channel_fresh: false,
+            bootstrap_failed: false,
             avatars: HashMap::new(),
             avatar_requested: HashSet::new(),
             avatar_loading: false,
@@ -678,6 +810,7 @@ impl App {
         if index >= self.conversations.len() {
             return;
         }
+        self.save_cache();
         self.save_draft();
         self.generation = self.next_request();
         self.media_generation += 1;
@@ -695,11 +828,24 @@ impl App {
         self.mode = Mode::Normal;
         self.focus = Focus::Messages;
         self.messages.clear();
+        self.channel_fresh = false;
         self.selected = 0;
         self.read_scroll = 0;
         self.loading = false;
         self.cursor.clear();
+        if !self.demo
+            && let Some(feed) = self.saved_feeds.get(&key).cloned()
+        {
+            self.restore_feed(feed, false);
+        }
         self.refresh_channel(false);
+        if let Some(cache) = &self.cache {
+            let channel = self.current_id().unwrap_or("").to_owned();
+            cache.select(channel.clone());
+            if self.messages.is_empty() {
+                cache.load(self.generation, channel, None);
+            }
+        }
     }
     pub fn refresh(&mut self, older: bool) {
         if self.focus == Focus::Thread && self.thread_view.is_some() {
@@ -739,7 +885,12 @@ impl App {
         };
         if self.worker.as_ref().unwrap().jobs.send(job).is_ok() {
             self.loading = true;
-            self.status = "Loading messages…".into();
+            self.status = if self.messages.is_empty() {
+                "Loading messages…"
+            } else {
+                "Showing cached messages • Updating…"
+            }
+            .into();
         }
     }
     pub fn refresh_thread(&mut self, older: bool) {
@@ -816,10 +967,21 @@ impl App {
             sending: self.pending_sends.contains_key(&key),
             ..Default::default()
         });
+        if !self.demo
+            && let Some(feed) = self.saved_feeds.get(&key).cloned()
+        {
+            self.restore_feed(feed, true);
+        }
         self.start_composing(true);
         self.refresh_thread(false);
+        if let (Some(cache), Some(view)) = (&self.cache, &self.thread_view)
+            && view.messages.len() <= 1
+        {
+            cache.load(view.generation, key.0, key.1);
+        }
     }
     pub fn close_thread(&mut self) {
+        self.save_cache();
         self.save_demo_messages();
         if let (Some(channel), Some(root), Some(view)) = (
             self.current_id().map(str::to_owned),
@@ -962,14 +1124,89 @@ impl App {
     }
     pub fn receive(&mut self, reply: Reply) {
         match reply {
+            Reply::Cache(crate::cache::Event::Startup(startup)) => {
+                // A fast live response always wins over a late disk read.
+                if self.conversations.is_empty() {
+                    self.workspace = startup.snapshot.workspace;
+                    self.me = startup.snapshot.me;
+                    self.users = startup.snapshot.users;
+                    self.people = startup.snapshot.people;
+                    self.conversations = startup.snapshot.conversations;
+                    self.person = self.conversations.iter().position(|c| c.is_im).unwrap_or(0);
+                    let index = self
+                        .conversations
+                        .iter()
+                        .position(|c| c.id == startup.channel)
+                        .unwrap_or(0);
+                    self.open_channel(index);
+                }
+            }
+            Reply::Cache(crate::cache::Event::Feed {
+                id,
+                channel,
+                thread,
+                feed,
+            }) => {
+                if self.current_id() != Some(channel.as_str()) {
+                    return;
+                }
+                if let Some(root) = thread {
+                    if self.thread.as_ref() != Some(&root)
+                        || !self.thread_view.as_ref().is_some_and(|view| {
+                            view.generation == id && !view.fresh && view.messages.len() <= 1
+                        })
+                    {
+                        return;
+                    }
+                    self.restore_feed(feed, true);
+                } else {
+                    if id != self.generation || self.channel_fresh || !self.messages.is_empty() {
+                        return;
+                    }
+                    self.restore_feed(feed, false);
+                }
+                self.status =
+                    if self.loading || self.thread_view.as_ref().is_some_and(|v| v.loading) {
+                        "Showing cached messages • Updating…".into()
+                    } else {
+                        format!("Showing cached messages • {}", self.status)
+                    };
+            }
+            Reply::Cache(crate::cache::Event::Error(error)) => {
+                self.status =
+                    format!("Local cache unavailable: {error} • Slack connection remains active");
+            }
             Reply::Avatars(photos) => {
                 self.avatar_loading = false;
                 self.avatars.extend(photos);
             }
             Reply::Bootstrap(result) => {
-                self.loading = false;
+                if self.conversations.is_empty() {
+                    self.loading = false;
+                }
                 match result {
                     Ok(data) => {
+                        let reconnecting = self.bootstrap_failed;
+                        self.bootstrap_failed = false;
+                        if let Some(cache) = &self.cache {
+                            cache.snapshot(data.clone());
+                        }
+                        let active = self.current_id().map(str::to_owned);
+                        if active
+                            .as_ref()
+                            .is_some_and(|id| !data.conversations.iter().any(|c| &c.id == id))
+                        {
+                            // Persist/detach while the old numeric index still refers to
+                            // the old channel. The refreshed list can have different IDs.
+                            self.save_cache();
+                            self.save_draft();
+                            self.messages.clear();
+                            self.cursor.clear();
+                            self.channel_fresh = false;
+                            self.thread = None;
+                            self.thread_view = None;
+                            self.channel = usize::MAX;
+                        }
                         self.workspace = data.workspace;
                         self.me = data.me;
                         self.users = data.users;
@@ -985,11 +1222,29 @@ impl App {
                             self.status =
                                 "No conversations. Check Slack scopes and channel membership."
                                     .into();
+                        } else if let Some(index) =
+                            active.and_then(|id| self.conversations.iter().position(|c| c.id == id))
+                        {
+                            self.channel = index;
+                            if self.conversations[index].is_im {
+                                self.person = index;
+                            } else {
+                                self.sidebar = index;
+                            }
+                            if reconnecting {
+                                self.loading = false;
+                                self.refresh_channel(false);
+                            }
                         } else {
                             self.open_channel(0);
                         }
                     }
-                    Err(e) => self.status = format!("{e:#} • R retries connection"),
+                    Err(e) => {
+                        self.bootstrap_failed = true;
+                        self.status = format!(
+                            "{e:#} • cached history remains available • R retries connection"
+                        );
+                    }
                 }
             }
             Reply::Counts(result) => {
@@ -1035,6 +1290,7 @@ impl App {
                 }
                 match result {
                     Ok(mut history) => {
+                        let oldest = history.messages.first().map(|m| m.ts.clone());
                         let latest = history.messages.last().map(|m| m.ts.clone());
                         if thread.is_none() {
                             self.notifications.observe(
@@ -1044,7 +1300,10 @@ impl App {
                                 append,
                             );
                         }
-                        if let Some(sent) = self.sent_messages.get_mut(&(channel, thread.clone())) {
+                        if let Some(sent) = self
+                            .sent_messages
+                            .get_mut(&(channel.clone(), thread.clone()))
+                        {
                             sent.retain(|message| {
                                 !history.messages.iter().any(|m| m.ts == message.ts)
                             });
@@ -1052,34 +1311,44 @@ impl App {
                         }
                         let (messages, selected, cursor) = if thread.is_some() {
                             let view = self.thread_view.as_mut().unwrap();
+                            view.fresh = true;
                             if latest.is_some() {
                                 view.latest = latest;
                             }
                             (&mut view.messages, &mut view.selected, &mut view.cursor)
                         } else {
+                            self.channel_fresh = true;
                             (&mut self.messages, &mut self.selected, &mut self.cursor)
                         };
                         let selected_ts = messages.get(*selected).map(|m| m.ts.clone());
-                        if append || thread.is_some() {
-                            messages.extend(history.messages);
-                        } else {
-                            let reading = (self.mode == Mode::Read)
-                                .then(|| messages.get(*selected).cloned())
-                                .flatten();
-                            *messages = history.messages;
-                            if let Some(reading) = reading
-                                && !messages.iter().any(|m| m.ts == reading.ts)
-                            {
-                                messages.push(reading);
-                            }
+                        let authoritative = !append && thread.is_none();
+                        let retain_older = authoritative && !history.cursor.is_empty();
+                        let reading = (self.mode == Mode::Read)
+                            .then(|| messages.get(*selected).cloned())
+                            .flatten();
+                        if authoritative {
+                            messages.retain(|m| {
+                                retain_older && oldest.as_ref().is_none_or(|ts| &m.ts < ts)
+                            });
                         }
-                        messages.sort_by(|a, b| a.ts.cmp(&b.ts));
-                        messages.dedup_by(|a, b| a.ts == b.ts);
+                        let mut merged: std::collections::BTreeMap<_, _> =
+                            messages.drain(..).map(|m| (m.ts.clone(), m)).collect();
+                        for message in history.messages {
+                            merged.insert(message.ts.clone(), message);
+                        }
+                        if let Some(reading) = reading {
+                            merged.entry(reading.ts.clone()).or_insert(reading);
+                        }
+                        *messages = merged.into_values().collect();
+                        // Always walk the live cursor. Apparent overlap through a
+                        // locally sent message cannot establish contiguous history.
+                        // Revisiting cached rows is preferable to silently skipping a gap.
                         *cursor = history.cursor;
                         *selected = selected_ts
                             .and_then(|ts| messages.iter().position(|m| m.ts == ts))
                             .unwrap_or_else(|| messages.len().saturating_sub(1));
                         self.status = "Updated • R refresh • ? shortcuts".into();
+                        self.save_cache();
                     }
                     Err(e) => self.status = format!("{e:#}"),
                 }
@@ -1104,6 +1373,16 @@ impl App {
                     Ok(mut message) => {
                         if message.user.is_empty() {
                             message.user = self.me.clone();
+                        }
+                        if let Some(cache) = &self.cache {
+                            cache.message(channel.clone(), thread.clone(), message.clone());
+                        }
+                        if let Some(feed) =
+                            self.saved_feeds.get_mut(&(channel.clone(), thread.clone()))
+                        {
+                            feed.messages.retain(|m| m.ts != message.ts);
+                            feed.messages.push(message.clone());
+                            feed.messages.sort_by(|a, b| a.ts.cmp(&b.ts));
                         }
                         self.sent_messages
                             .entry((channel.clone(), thread.clone()))
@@ -1139,6 +1418,7 @@ impl App {
                             }
                         }
                         self.status = "Message sent".into();
+                        self.save_cache();
                     }
                     Err(e) => {
                         self.status = format!("{e:#} • draft kept; check Slack before retrying")
@@ -1328,7 +1608,7 @@ impl App {
                     self.move_selection(isize::MAX);
                 }
                 KeyCode::Char('R') => {
-                    if self.conversations.is_empty() {
+                    if self.conversations.is_empty() || self.bootstrap_failed {
                         if let Some(worker) = &self.worker {
                             let _ = worker.jobs.send(Job::Bootstrap);
                             self.loading = true;

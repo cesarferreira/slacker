@@ -99,8 +99,9 @@ slacker
 On first launch, choose one of your signed-in workspaces. There is no Slack app
 to register and no token to copy. On macOS, allow the **Slack Safe Storage**
 Keychain prompt if it appears. The selected workspace is remembered; credentials
-are read fresh from the desktop session on each launch. Slacker stores only the
-workspace choice, never a duplicate token or cookie file.
+are read fresh from the desktop session on each launch. Slacker remembers the
+workspace choice and caches loaded history, but never saves a duplicate token or
+cookie file.
 
 ```bash
 slacker auth                    # choose or reconnect a workspace
@@ -123,6 +124,32 @@ draft. Drafts are separate for each conversation and thread during the session.
 `R` refreshes manually. Automatic refresh runs every 60 seconds; nonzero intervals
 below 60 seconds are clamped to 60. Slack rate limits show the server's retry
 delay, and sending is never retried automatically.
+
+### Local history cache
+
+Previously loaded conversations, user names, messages, and thread replies are
+cached in SQLite. On reopening Slacker, the last conversation appears from the
+cache while authentication and fresh history load in the background. Switching
+back to a visited conversation or thread also restores its messages and reading
+position without clearing the feed. New responses update edited messages and add
+new ones; cached older pages remain available. History stays readable if Slack
+is slow or offline. `R` retries a failed connection or refreshes the active feed.
+After a refresh, `PgUp` may revisit cached pages while following Slack's current
+pagination cursor; this avoids skipping messages that arrived while offline.
+
+The cache lives at `~/Library/Caches/slacker/history.sqlite3` on macOS, or
+`$XDG_CACHE_HOME/slacker/history.sqlite3` (normally `~/.cache/slacker/history.sqlite3`)
+on Linux. It contains **unencrypted message content and profile metadata**, with
+owner-only file permissions on Unix. It does not store authentication tokens or
+cookies. Each credential and API endpoint has a separate opaque namespace, so
+different accounts/workspaces do not share history; rotating credentials starts
+a fresh cache. Disk reads and writes run on a separate thread, and cache failures
+do not prevent using Slack online.
+
+Only fetched history is cached, not the entire workspace. Retention is limited to
+the latest 500 loaded messages per feed and 100 recently used channel/thread
+feeds per credential. Unused entries expire after 30 days. Close Slacker and
+delete `history.sqlite3` to clear the cache. Demo mode never writes to it.
 
 <details>
 <summary>Advanced: use an existing OAuth token instead</summary>
@@ -164,6 +191,15 @@ including daylight saving. Profile photos load in the background and are reused
 throughout the session. Kitty-compatible terminals show native images;
 `--graphics off` uses small pixelated photos. Initials appear while a photo is
 loading or unavailable.
+
+Click an underlined link or preview title to open it in your default browser (or
+mail app for `mailto:` links). Every wrapped segment keeps the full destination,
+so URLs split across lines are still clickable in conversations, threads, and
+the full-message reader. Link clicks preserve the active composer and draft.
+Slack-provided link previews appear as cards with titles, descriptions, and
+metadata such as GitHub website/star fields. Preview metadata is cached with the
+message. No extra requests are made to GitHub or linked websites; links without
+a Slack-provided preview stay clickable without a card.
 
 Drag the divider beside the sidebar to resize it. Clicking a replies link opens
 an independent thread panel on the right; drag its divider to adjust its width.

@@ -143,11 +143,17 @@ fn main() -> Result<()> {
         let slack = if let Some(token) = token() {
             Slack::new(token)?
         } else {
-            slacker::auth::connect(cli.workspace.as_deref(), false)?
+            slacker::auth::connect_for_app(cli.workspace.as_deref())?
         };
+        let namespace = slack.cache_namespace();
         let worker = Worker::new(slack);
         worker.jobs.send(Job::Bootstrap)?;
-        App::new(Some(worker), graphics)
+        let mut app = App::new(Some(worker), graphics);
+        match slacker::cache::Cache::default_path() {
+            Ok(path) => app.enable_cache(path, namespace),
+            Err(e) => app.status = format!("Local cache unavailable: {e:#}"),
+        }
+        app
     };
     let standalone = app.viewer.is_some();
     let mut terminal = ratatui::try_init()?;
@@ -171,6 +177,7 @@ fn main() -> Result<()> {
         cli.channel,
         cli.bell,
     );
+    app.save_cache();
     drop(app);
     drop(guard);
     result
@@ -386,6 +393,11 @@ fn run(
                 }
                 _ => {}
             }
+        }
+        if let Some(url) = ui.pending_url.take()
+            && let Err(e) = slacker::links::open(&url)
+        {
+            app.status = format!("{e:#}");
         }
     }
     Ok(())
